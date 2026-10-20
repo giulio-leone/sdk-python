@@ -1,8 +1,11 @@
 import type { Sandbox } from '../sandbox/base.js'
+import type { Storage } from '../storage/storage.js'
+import type { ContextManager } from '../context-manager/context-manager.js'
 import type { StateStore } from '../state-store.js'
 import type { ContentBlock, ContentBlockData, Message, MessageData, StopReason, SystemPrompt } from './messages.js'
 import type { Interrupt } from '../interrupt.js'
 import type { InterruptResponseContent, InterruptResponseContentData } from './interrupt.js'
+import type { Checkpoint, CheckpointResumeContent } from '../experimental/checkpoint.js'
 import type { AgentTrace } from '../telemetry/tracer.js'
 import type { Snapshot } from './snapshot.js'
 import type { TakeSnapshotOptions } from '../agent/snapshot.js'
@@ -49,6 +52,9 @@ import { AgentMetrics } from '../telemetry/meter.js'
  * - `ContentBlock[]` | `ContentBlockData[]` - Array of content blocks (creates single user Message)
  * - `Message[]` | `MessageData[]` - Array of messages (appends all to conversation)
  * - `InterruptResponseContent[]` - Array of interrupt responses (resumes from interrupted state)
+ * - `CheckpointResumeContent` - Resume payload for a checkpointing agent
+ *
+ * @experimental The `CheckpointResumeContent` member is experimental and subject to change.
  */
 export type InvokeArgs =
   | string
@@ -58,6 +64,7 @@ export type InvokeArgs =
   | MessageData[]
   | InterruptResponseContent[]
   | InterruptResponseContentData[]
+  | CheckpointResumeContent
 
 /**
  * Per-invocation state threaded through hooks and tools for a single agent
@@ -185,6 +192,13 @@ export interface InvokeOptions {
 }
 
 /**
+ * The cap names recognized by {@link InvokeOptions.limits}.
+ *
+ * @internal
+ */
+export const LIMITS_KEYS = ['turns', 'outputTokens', 'totalTokens'] as const
+
+/**
  * Interface for agents that support request-response invocation.
  *
  * Both `Agent` (full orchestration agent) and `A2AAgent` (remote agent proxy)
@@ -251,6 +265,16 @@ export interface LocalAgent {
   readonly id: string
 
   /**
+   * A stable, unique identifier for the current conversation session.
+   *
+   * Resolution order:
+   * 1. If a SessionManager is attached, returns its session ID.
+   * 2. Otherwise, returns a lazily-generated random 8-character hex string
+   *    cached for the lifetime of the agent instance.
+   */
+  readonly sessionId: string
+
+  /**
    * App state storage accessible to tools and application logic.
    */
   appState: StateStore
@@ -281,9 +305,34 @@ export interface LocalAgent {
   readonly sandbox: Sandbox
 
   /**
+   * Default storage backend for agent subsystems.
+   *
+   * When set, subsystems that do not have their own explicit storage (e.g.,
+   * SessionManager, ContextOffloader) resolve from this. Each subsystem
+   * auto-namespaces under its own prefix to avoid key collisions.
+   */
+  readonly storage?: Storage | undefined
+
+  /**
+   * The resolved context manager instance. Present when a preset, config, or instance was provided.
+   *
+   * @internal
+   */
+  readonly contextManager?: ContextManager | undefined
+
+  /**
+   * Aggregated metrics for the agent's loop execution.
+   * Tracks cycle counts, token usage, tool execution stats, and model latency.
+   */
+  readonly metrics: AgentMetrics
+
+  /**
    * The model provider used by the agent for inference.
    */
   readonly model: Model
+
+  /** Model used for auxiliary side calls; defaults to `model`. See {@link Agent.auxModel}. */
+  readonly auxModel: Model
 
   /**
    * The system prompt to pass to the model provider.
@@ -303,7 +352,7 @@ export interface LocalAgent {
    * callback: async ({ items }, context) => {
    *   const results = []
    *   for (const item of items) {
-   *     if (context.agent.cancelSignal.aborted) return results
+   *     if (context?.cancelSignal.aborted) return results
    *     results.push(await process(item))
    *   }
    *   return results
@@ -313,7 +362,7 @@ export interface LocalAgent {
    * **Signal forwarding** — pass to APIs that accept `AbortSignal`:
    * ```ts
    * callback: async ({ url }, context) => {
-   *   const res = await fetch(url, { signal: context.agent.cancelSignal })
+   *   const res = await fetch(url, { signal: context?.cancelSignal })
    *   return res.text()
    * }
    * ```
@@ -434,6 +483,15 @@ export class AgentResult {
    */
   readonly interrupts?: Interrupt[]
 
+  /**
+   * Checkpoint captured when the agent paused for durable execution. Populated
+   * only when `stopReason` is `'checkpoint'`. See the experimental checkpoint
+   * module for usage.
+   *
+   * @experimental
+   */
+  readonly checkpoint?: Checkpoint
+
   constructor(data: {
     stopReason: StopReason
     lastMessage: Message
@@ -442,6 +500,7 @@ export class AgentResult {
     metrics?: AgentMetrics
     structuredOutput?: z.output<z.ZodType>
     interrupts?: Interrupt[]
+    checkpoint?: Checkpoint
   }) {
     this.stopReason = data.stopReason
     this.lastMessage = data.lastMessage
@@ -458,10 +517,13 @@ export class AgentResult {
     if (data.interrupts !== undefined) {
       this.interrupts = data.interrupts
     }
+    if (data.checkpoint !== undefined) {
+      this.checkpoint = data.checkpoint
+    }
   }
 
   /**
-   * The most recent input token count from the last model invocation.
+   * The total prompt the model processed on the last invocation, including cached tokens.
    * Convenience accessor that delegates to `metrics.latestContextSize`.
    * Returns `undefined` when no metrics or invocations are available.
    */
@@ -470,7 +532,8 @@ export class AgentResult {
   }
 
   /**
-   * Projected context size for the next model call (inputTokens + outputTokens from the last call).
+   * Projected context size for the next model call (total prompt including cached tokens plus the
+   * generated output from the last call).
    * Convenience accessor that delegates to `metrics.projectedContextSize`.
    * Returns `undefined` when no metrics or invocations are available.
    */
@@ -494,6 +557,7 @@ export class AgentResult {
       stopReason: this.stopReason,
       lastMessage: this.lastMessage,
       ...(this.structuredOutput !== undefined && { structuredOutput: this.structuredOutput }),
+      ...(this.checkpoint !== undefined && { checkpoint: this.checkpoint.toJSON() }),
     }
   }
 

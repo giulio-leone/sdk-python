@@ -10,6 +10,7 @@ from strands.agent.conversation_manager.summarizing_conversation_manager import 
 )
 from strands.hooks.events import BeforeModelCallEvent
 from strands.hooks.registry import HookRegistry
+from strands.models.model import Model
 from strands.types.content import Messages
 from strands.types.exceptions import ContextWindowOverflowException
 from tests.fixtures.mocked_model_provider import MockedModelProvider
@@ -37,10 +38,11 @@ async def _mock_model_stream_error(error):
 class MockAgent:
     """Mock agent for testing summarization.
 
-    In the default path (no summarization_agent) the manager now calls
-    ``agent.model.stream()`` directly, so the model attribute must return a
-    proper async iterable.  When used as a *summarization_agent* the manager
-    still calls ``agent("…")``, so the ``__call__`` interface is kept.
+    In the default path (no summarization_agent) the manager calls
+    ``agent.aux_model.stream()`` directly, so the model attribute must return a
+    proper async iterable; ``aux_model`` mirrors the real agent's default of
+    ``model``. When used as a *summarization_agent* the manager still calls
+    ``agent("…")``, so the ``__call__`` interface is kept.
     """
 
     def __init__(self, summary_response="This is a summary of the conversation."):
@@ -49,6 +51,7 @@ class MockAgent:
         self.messages = []
         self.model = Mock()
         self.model.stream = Mock(side_effect=lambda *a, **kw: _mock_model_stream(self.summary_response))
+        self.aux_model = self.model
         self.call_tracker = Mock()
         self.tool_registry = Mock()
         self.tool_names = []
@@ -143,6 +146,24 @@ def test_reduce_context_with_summarization(summarizing_manager, mock_agent):
     assert "Response 3" in str(mock_agent.messages[-1]["content"])
 
 
+def test_reduce_context_summary_message_has_durable_id(summarizing_manager, mock_agent):
+    """The generated summary message should carry a durable tracking id like any other message."""
+    mock_agent.messages = [
+        {"role": "user", "content": [{"text": "Message 1"}]},
+        {"role": "assistant", "content": [{"text": "Response 1"}]},
+        {"role": "user", "content": [{"text": "Message 2"}]},
+        {"role": "assistant", "content": [{"text": "Response 2"}]},
+        {"role": "user", "content": [{"text": "Message 3"}]},
+        {"role": "assistant", "content": [{"text": "Response 3"}]},
+    ]
+
+    summarizing_manager.reduce_context(mock_agent)
+
+    summary_message = mock_agent.messages[0]
+    assert isinstance(summary_message.get("tracking_id"), str)
+    assert summary_message["tracking_id"]
+
+
 def test_reduce_context_too_few_messages_raises_exception(summarizing_manager, mock_agent):
     """Test that reduce_context raises exception when there are too few messages to summarize effectively."""
     # Create a scenario where calculation results in 0 messages to summarize
@@ -187,6 +208,7 @@ def test_reduce_context_raises_on_summarization_failure():
     failing_agent = Mock()
     failing_agent.model = Mock()
     failing_agent.model.stream = Mock(side_effect=lambda *a, **kw: _mock_model_stream_error(Exception("Agent failed")))
+    failing_agent.aux_model = failing_agent.model
     failing_agent_messages: Messages = [
         {"role": "user", "content": [{"text": "Message 1"}]},
         {"role": "assistant", "content": [{"text": "Response 1"}]},
@@ -246,6 +268,7 @@ def test_generate_summary_raises_on_model_failure():
     failing_agent = Mock()
     failing_agent.model = Mock()
     failing_agent.model.stream = Mock(side_effect=lambda *a, **kw: _mock_model_stream_error(Exception("Agent failed")))
+    failing_agent.aux_model = failing_agent.model
 
     manager = SummarizingConversationManager()
 
@@ -307,6 +330,33 @@ def test_apply_management_no_op(summarizing_manager, mock_agent):
 
     # Should never modify messages - summarization only happens on context overflow
     assert mock_agent.messages == original_messages
+
+
+def test_summarization_agent_reasoning_blocks_are_dropped_from_summary():
+    """A reasoning summarizer's reply is re-roled as user with only its text kept."""
+
+    class ReasoningMockAgent(MockAgent):
+        def __call__(self, prompt):
+            result = Mock()
+            result.message = {
+                "role": "assistant",
+                "content": [
+                    {"reasoningContent": {"reasoningText": {"text": "thinking", "signature": "sig"}}},
+                    {"text": "Summary"},
+                ],
+            }
+            return result
+
+    manager = SummarizingConversationManager(summarization_agent=cast("Agent", ReasoningMockAgent()))
+    messages: Messages = [
+        {"role": "user", "content": [{"text": "Hello"}]},
+        {"role": "assistant", "content": [{"text": "Hi there"}]},
+    ]
+
+    tru_summary = manager._generate_summary(messages, create_mock_agent())
+
+    exp_summary = {"role": "user", "content": [{"text": "Summary"}]}
+    assert tru_summary == exp_summary
 
 
 def test_init_with_custom_parameters():
@@ -452,6 +502,7 @@ def test_default_path_does_not_modify_agent_state_on_exception():
     mock_agent.model.stream = Mock(
         side_effect=lambda *a, **kw: _mock_model_stream_error(Exception("Summarization failed"))
     )
+    mock_agent.aux_model = mock_agent.model
 
     messages: Messages = [
         {"role": "user", "content": [{"text": "Hello"}]},
@@ -711,7 +762,7 @@ def test_summarizing_conversation_manager_properly_records_removed_message_count
     assert manager.removed_message_count == 0
 
     manager.reduce_context(agent)
-    # Assert the oldest message is the sumamry message
+    # Assert the oldest message is the summary message
     assert manager._summary_message["content"][0]["text"] == "Summary"
     # There are 8 messages in the agent messages array, since half will be summarized,
     # 4 will remain plus 1 summary message = 5
@@ -820,7 +871,9 @@ def _make_summarizing_threshold_agent(messages, summary_response="Summary of con
     agent.messages = messages
     agent.model = MagicMock()
     agent.model.context_window_limit = context_window_limit
+    agent.model.estimate_utilization = lambda input_tokens: Model.estimate_utilization(agent.model, input_tokens)
     agent.model.stream = Mock(side_effect=lambda *a, **kw: _mock_model_stream(summary_response))
+    agent.aux_model = agent.model
     return agent
 
 
@@ -882,7 +935,9 @@ def test_proactive_compression_swallows_errors():
     agent.messages = messages
     agent.model = MagicMock()
     agent.model.context_window_limit = 1000
+    agent.model.estimate_utilization = lambda input_tokens: Model.estimate_utilization(agent.model, input_tokens)
     agent.model.stream = Mock(side_effect=lambda *a, **kw: _mock_model_stream_error(RuntimeError("model failed")))
+    agent.aux_model = agent.model
 
     registry = HookRegistry()
     manager.register_hooks(registry)

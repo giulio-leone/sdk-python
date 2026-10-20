@@ -32,6 +32,7 @@ import type { StreamOptions } from '../model.js'
 import { logger } from '../../logging/logger.js'
 import { MODEL_DEFAULTS } from '../defaults.js'
 import { formatImageDataUrl, warnManagedParams as warnManagedParamsShared } from './formatting.js'
+import { applyCacheConfig } from './cache.js'
 import type { OpenAIResponsesConfig } from './types.js'
 
 export const DEFAULT_RESPONSES_MODEL_ID = MODEL_DEFAULTS.openai.modelId
@@ -125,6 +126,8 @@ export function formatResponsesRequest(
   if (config.maxTokens !== undefined) request.max_output_tokens = config.maxTokens
   if (config.topP !== undefined) request.top_p = config.topP
 
+  applyCacheConfig(request, config.cacheConfig, options?.agentMetadata)
+
   return request
 }
 
@@ -171,7 +174,7 @@ function formatResponsesMessages(messages: Message[]): ResponseInputItem[] {
         case 'citationsBlock': {
           const citBlock = block as { content: Array<{ text: string }> }
           for (const c of citBlock.content) {
-            contentItems.push({ type: 'output_text', text: c.text })
+            contentItems.push({ type: role === 'user' ? 'input_text' : 'output_text', text: c.text })
           }
           break
         }
@@ -214,15 +217,33 @@ function formatResponsesMessages(messages: Message[]): ResponseInputItem[] {
       }
     }
 
-    // Cast is needed because assistant messages here use `output_text` content
-    // blocks, which the SDK's input types model as `ResponseOutputMessage` —
-    // a response-shaped type that requires `id`/`status`/`annotations`. The API
-    // accepts these fields as omitted on input, but the SDK types don't reflect that.
     if (contentItems.length > 0) {
-      input.push({
-        role,
-        content: contentItems,
-      } as unknown as ResponseInputItem)
+      if (role === 'assistant') {
+        // Only the string EasyInputMessage form is a valid assistant *input* shape
+        // without the full ResponseOutputMessage metadata (id/status/annotations),
+        // which has already been discarded by this point. Non-text assistant history
+        // has no valid input shape either. Replaying verbatim output items is
+        // tracked in https://github.com/strands-agents/harness-sdk/issues/3389.
+        const droppedTypes = contentItems.filter((item) => item.type !== 'output_text').map((item) => item.type)
+        if (droppedTypes.length > 0) {
+          logger.warn(
+            `content_type=<${droppedTypes.join(', ')}> | non-text assistant history content has no valid responses api input shape | dropping`
+          )
+        }
+        const text = contentItems
+          .filter((item) => item.type === 'output_text')
+          .map((item) => item.text as string)
+          .join('\n')
+        if (text) input.push({ role: 'assistant', content: text })
+      } else {
+        // Cast is needed only because `contentItems` is built as a loosely-typed
+        // record array; the user-role items themselves (`input_text`/`input_image`/
+        // `input_file`) are valid `EasyInputMessage` content.
+        input.push({
+          role,
+          content: contentItems,
+        } as unknown as ResponseInputItem)
+      }
     }
 
     input.push(...toolCallItems)
@@ -337,6 +358,7 @@ export interface ResponsesStreamState {
     outputTokens: number
     totalTokens: number
     cacheReadInputTokens?: number
+    cacheWriteInputTokens?: number
   } | null
   stopReason: StopReason
 }
@@ -357,11 +379,12 @@ export function createResponsesStreamState(): ResponsesStreamState {
 
 /**
  * Maps a Responses API `usage` object to the SDK's usage shape, including
- * prompt-cache reads. The Responses API reports cache hits via
- * `usage.input_tokens_details.cached_tokens`; surfacing it as
- * `cacheReadInputTokens` keeps the Responses path consistent with the Bedrock,
+ * prompt-cache reads and writes. The Responses API reports cache hits via
+ * `usage.input_tokens_details.cached_tokens` and cache writes via
+ * `cache_write_tokens`; surfacing them as `cacheReadInputTokens` /
+ * `cacheWriteInputTokens` keeps the Responses path consistent with the Bedrock,
  * Anthropic, and Vercel model adapters (and lets `telemetry/tracer.ts` emit
- * `gen_ai.usage.cache_read_input_tokens`).
+ * `gen_ai.usage.cache_read.input_tokens`).
  *
  * @internal
  */
@@ -375,7 +398,24 @@ function mapResponsesUsage(usage: ResponseUsage): NonNullable<ResponsesStreamSta
   if (typeof cached === 'number' && cached > 0) {
     mapped.cacheReadInputTokens = cached
   }
+  // GPT-5.6 reports cache writes here; the openai package's InputTokensDetails
+  // does not type the field yet, so read it through a narrow cast.
+  const cacheWrite = (usage.input_tokens_details as { cache_write_tokens?: number } | undefined)?.cache_write_tokens
+  if (typeof cacheWrite === 'number' && cacheWrite > 0) {
+    mapped.cacheWriteInputTokens = cacheWrite
+  }
   return mapped
+}
+
+function createResponsesStreamError(
+  message: string | undefined,
+  code: string | null | undefined
+): Error & { code?: string } {
+  const error = new Error(message || 'OpenAI Responses API response failed') as Error & { code?: string }
+  if (code) {
+    error.code = code
+  }
+  return error
 }
 
 /**
@@ -499,6 +539,15 @@ export function mapResponsesEventToSDK(
         state.stopReason = 'maxTokens'
       }
       break
+    }
+
+    case 'response.failed': {
+      const error = event.response.error
+      throw createResponsesStreamError(error?.message, error?.code)
+    }
+
+    case 'error': {
+      throw createResponsesStreamError(event.message, event.code)
     }
 
     case 'response.completed': {

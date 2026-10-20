@@ -10,8 +10,8 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.trace import StatusCode
 from pydantic import BaseModel
 
-from strands._middleware import MiddlewareRegistry
 from strands.event_loop.event_loop import event_loop_cycle, recurse_event_loop
+from strands.middleware._registry import MiddlewareRegistry
 from strands.telemetry.metrics import EventLoopMetrics
 from strands.telemetry.tracer import Tracer
 from strands.tools.registry import ToolRegistry
@@ -50,7 +50,11 @@ def mock_agent():
     agent.event_loop_metrics = EventLoopMetrics()
     agent.event_loop_metrics.reset_usage_metrics()
     agent.hooks = Mock()
-    agent.hooks.invoke_callbacks_async = AsyncMock()
+
+    async def invoke_callbacks_async(event):
+        return event, []
+
+    agent.hooks.invoke_callbacks_async = AsyncMock(side_effect=invoke_callbacks_async)
     agent.trace_span = None
     agent.trace_attributes = {}
     agent.tool_executor = Mock()
@@ -61,6 +65,9 @@ def mock_agent():
     agent._interrupt_state.activated = False
     agent._interrupt_state.context = {}
     agent._cancel_signal = threading.Event()
+    agent._observe_cancellation = agent._cancel_signal.is_set
+    agent._deferred_cancel = False
+    agent._cancel_message = None
     agent._model_state = {}
     agent._system_prompt_content = None
     agent._middleware_registry = MiddlewareRegistry()
@@ -205,12 +212,10 @@ async def test_event_loop_forces_structured_output_on_end_turn(
         )
         await alist(stream)
 
-        # Should have appended a message to force structured output
-        mock_agent._append_messages.assert_called_once()
-        args = mock_agent._append_messages.call_args[0][0]
-        assert args["role"] == "user"
-        # Should use the default prompt
-        assert args["content"][0]["text"] == DEFAULT_STRUCTURED_OUTPUT_PROMPT
+        # The force-structured-output prompt should have been appended (among other messages)
+        appended_messages = [call.args[0] for call in mock_agent._append_messages.call_args_list]
+        expected_force_prompt = {"role": "user", "content": [{"text": DEFAULT_STRUCTURED_OUTPUT_PROMPT}]}
+        assert appended_messages.count(expected_force_prompt) == 1
 
         # Should have called recurse_event_loop with the context
         mock_recurse.assert_called_once()
@@ -260,11 +265,10 @@ async def test_event_loop_forces_structured_output_with_custom_prompt(mock_agent
         )
         await alist(stream)
 
-        # Should have appended a message with the custom prompt
-        mock_agent._append_messages.assert_called_once()
-        args = mock_agent._append_messages.call_args[0][0]
-        assert args["role"] == "user"
-        assert args["content"][0]["text"] == custom_prompt
+        # The custom force prompt should have been appended (among other messages)
+        appended_messages = [call.args[0] for call in mock_agent._append_messages.call_args_list]
+        expected_force_prompt = {"role": "user", "content": [{"text": custom_prompt}]}
+        assert appended_messages.count(expected_force_prompt) == 1
 
 
 @patch("strands.event_loop.event_loop.get_tracer")
@@ -588,3 +592,54 @@ async def test_structured_output_stops_loop_after_extraction(mock_agent, structu
 
     # Extract_result should have been called
     structured_output_context.extract_result.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_event_loop_forces_structured_output_tool_by_name(mock_agent, agenerator, alist):
+    """Test that the forced retry names the output tool instead of using any."""
+    structured_output_context = StructuredOutputContext(structured_output_model=ProductModel)
+    mock_agent.model.stream.side_effect = [
+        agenerator(
+            [
+                {"contentBlockDelta": {"delta": {"text": "Here is the product info"}}},
+                {"contentBlockStop": {}},
+                {"messageStop": {"stopReason": "end_turn"}},
+            ]
+        ),
+        agenerator(
+            [
+                {
+                    "contentBlockStart": {
+                        "start": {
+                            "toolUse": {
+                                "toolUseId": "t1",
+                                "name": "ProductModel",
+                            }
+                        }
+                    }
+                },
+                {
+                    "contentBlockDelta": {
+                        "delta": {"toolUse": {"input": '{"title": "Book", "price": 19.99, "in_stock": true}'}}
+                    }
+                },
+                {"contentBlockStop": {}},
+                {"messageStop": {"stopReason": "tool_use"}},
+            ]
+        ),
+    ]
+
+    mock_agent.tool_executor._execute = Mock(return_value=agenerator([]))
+    test_result = ProductModel(title="Book", price=19.99, in_stock=True)
+    structured_output_context.extract_result = Mock(return_value=test_result)
+
+    stream = event_loop_cycle(
+        agent=mock_agent,
+        invocation_state={},
+        structured_output_context=structured_output_context,
+    )
+    await alist(stream)
+
+    assert mock_agent.model.stream.call_count == 2
+    forced_call = mock_agent.model.stream.call_args_list[1]
+    assert forced_call.kwargs["tool_choice"] == {"tool": {"name": "ProductModel"}}

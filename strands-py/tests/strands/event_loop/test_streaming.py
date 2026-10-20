@@ -1,3 +1,4 @@
+import threading
 import unittest.mock
 from typing import cast
 
@@ -124,6 +125,20 @@ def test_normalize_blank_messages_content_text(messages, exp_result):
     tru_result = strands.event_loop.streaming._normalize_messages(messages)
 
     assert tru_result == exp_result
+
+
+def test_normalize_messages_does_not_mutate_original():
+    import copy
+
+    original_messages = [
+        {"role": "assistant", "content": [{"text": " \n"}, {"toolUse": {"name": "invalid tool"}}]},
+    ]
+    expected_original = copy.deepcopy(original_messages)
+
+    _ = strands.event_loop.streaming._normalize_messages(original_messages)
+
+    # The original messages structure should remain completely untouched
+    assert original_messages == expected_original
 
 
 def test_handle_message_start():
@@ -384,6 +399,63 @@ def test_handle_content_block_delta(event: ContentBlockDeltaEvent, event_type, s
                 "redactedContent": b"",
             },
         ),
+        # Tool Use - Malformed input JSON
+        (
+            {
+                "content": [],
+                "current_tool_use": {"toolUseId": "123", "name": "test", "input": "{invalid json}"},
+                "text": "",
+                "reasoningText": "",
+                "citationsContent": [],
+                "redactedContent": b"",
+            },
+            {
+                "content": [{"toolUse": {"toolUseId": "123", "name": "test", "input": {}}}],
+                "current_tool_use": {},
+                "text": "",
+                "reasoningText": "",
+                "citationsContent": [],
+                "redactedContent": b"",
+            },
+        ),
+        # Tool Use - Empty string input (zero-argument tool)
+        (
+            {
+                "content": [],
+                "current_tool_use": {"toolUseId": "456", "name": "no_arg_tool", "input": ""},
+                "text": "",
+                "reasoningText": "",
+                "citationsContent": [],
+                "redactedContent": b"",
+            },
+            {
+                "content": [{"toolUse": {"toolUseId": "456", "name": "no_arg_tool", "input": {}}}],
+                "current_tool_use": {},
+                "text": "",
+                "reasoningText": "",
+                "citationsContent": [],
+                "redactedContent": b"",
+            },
+        ),
+        # Tool Use - Whitespace-only input (zero-argument tool)
+        (
+            {
+                "content": [],
+                "current_tool_use": {"toolUseId": "789", "name": "whitespace_tool", "input": "   \n\t  "},
+                "text": "",
+                "reasoningText": "",
+                "citationsContent": [],
+                "redactedContent": b"",
+            },
+            {
+                "content": [{"toolUse": {"toolUseId": "789", "name": "whitespace_tool", "input": {}}}],
+                "current_tool_use": {},
+                "text": "",
+                "reasoningText": "",
+                "citationsContent": [],
+                "redactedContent": b"",
+            },
+        ),
         # Text
         (
             {
@@ -475,7 +547,6 @@ def test_handle_content_block_delta(event: ContentBlockDeltaEvent, event_type, s
                 "current_tool_use": {},
                 "text": "",
                 "reasoningText": "",
-                "signature": "123",
                 "citationsContent": [],
                 "redactedContent": b"",
             },
@@ -515,7 +586,6 @@ def test_handle_content_block_delta(event: ContentBlockDeltaEvent, event_type, s
                 "current_tool_use": {},
                 "text": "",
                 "reasoningText": "",
-                "signature": "123",
                 "citationsContent": [],
                 "redactedContent": b"",
             },
@@ -558,12 +628,137 @@ def test_handle_content_block_delta(event: ContentBlockDeltaEvent, event_type, s
                 "redactedContent": b"",
             },
         ),
+        # Regression: text and a pending tool use both land in content (#4004).
+        (
+            {
+                "content": [],
+                "current_tool_use": {"toolUseId": "t1", "name": "read_file", "input": "{}"},
+                "text": "Let me check that for you.",
+                "reasoningText": "",
+                "citationsContent": [],
+                "redactedContent": b"",
+            },
+            {
+                "content": [
+                    {"toolUse": {"toolUseId": "t1", "name": "read_file", "input": {}}},
+                    {"text": "Let me check that for you."},
+                ],
+                "current_tool_use": {},
+                "text": "",
+                "reasoningText": "",
+                "citationsContent": [],
+                "redactedContent": b"",
+            },
+        ),
+        # Regression: reasoning text + pending tool use — both must land (issue #4004)
+        (
+            {
+                "content": [],
+                "current_tool_use": {"toolUseId": "t1", "name": "lookup", "input": '{"k": "v"}'},
+                "text": "",
+                "reasoningText": "thinking...",
+                "signature": "sig-123",
+                "citationsContent": [],
+                "redactedContent": b"",
+            },
+            {
+                "content": [
+                    {"toolUse": {"toolUseId": "t1", "name": "lookup", "input": {"k": "v"}}},
+                    {
+                        "reasoningContent": {
+                            "reasoningText": {"text": "thinking...", "signature": "sig-123"},
+                        },
+                    },
+                ],
+                "current_tool_use": {},
+                "text": "",
+                "reasoningText": "",
+                "citationsContent": [],
+                "redactedContent": b"",
+            },
+        ),
+        # Regression: text + reasoning + pending tool use — all three blocks land (issue #4004)
+        (
+            {
+                "content": [],
+                "current_tool_use": {"toolUseId": "t1", "name": "multi", "input": "{}"},
+                "text": "ok",
+                "reasoningText": "hmm",
+                "citationsContent": [],
+                "redactedContent": b"",
+            },
+            {
+                "content": [
+                    {"toolUse": {"toolUseId": "t1", "name": "multi", "input": {}}},
+                    {"text": "ok"},
+                    {"reasoningContent": {"reasoningText": {"text": "hmm"}}},
+                ],
+                "current_tool_use": {},
+                "text": "",
+                "reasoningText": "",
+                "citationsContent": [],
+                "redactedContent": b"",
+            },
+        ),
     ],
 )
 def test_handle_content_block_stop(state, exp_updated_state):
     tru_updated_state = strands.event_loop.streaming.handle_content_block_stop(state)
 
     assert tru_updated_state == exp_updated_state
+
+
+@unittest.mock.patch("strands.event_loop.streaming.logger")
+def test_handle_content_block_stop_logs_warning_on_malformed_json(mock_logger):
+    state = {
+        "content": [],
+        "current_tool_use": {"toolUseId": "123", "name": "test_tool", "input": "{invalid json}"},
+        "text": "",
+        "reasoningText": "",
+        "citationsContent": [],
+        "redactedContent": b"",
+    }
+
+    strands.event_loop.streaming.handle_content_block_stop(state)
+
+    mock_logger.warning.assert_called_once()
+    call_args = mock_logger.warning.call_args
+    assert "test_tool" in str(call_args)
+    assert "{invalid json}" in str(call_args)
+
+
+@unittest.mock.patch("strands.event_loop.streaming.logger")
+def test_handle_content_block_stop_no_warning_for_empty_input(mock_logger):
+    """Zero-argument tools with empty input should not log a warning."""
+    state = {
+        "content": [],
+        "current_tool_use": {"toolUseId": "123", "name": "zero_arg_tool", "input": ""},
+        "text": "",
+        "reasoningText": "",
+        "citationsContent": [],
+        "redactedContent": b"",
+    }
+
+    strands.event_loop.streaming.handle_content_block_stop(state)
+
+    mock_logger.warning.assert_not_called()
+
+
+@unittest.mock.patch("strands.event_loop.streaming.logger")
+def test_handle_content_block_stop_no_warning_for_whitespace_input(mock_logger):
+    """Zero-argument tools with whitespace-only input should not log a warning."""
+    state = {
+        "content": [],
+        "current_tool_use": {"toolUseId": "456", "name": "another_zero_arg", "input": "   \n\t  "},
+        "text": "",
+        "reasoningText": "",
+        "citationsContent": [],
+        "redactedContent": b"",
+    }
+
+    strands.event_loop.streaming.handle_content_block_stop(state)
+
+    mock_logger.warning.assert_not_called()
 
 
 def test_handle_message_stop():
@@ -1158,6 +1353,65 @@ async def test_process_stream_with_signature(agenerator, alist):
 
 
 @pytest.mark.asyncio
+async def test_process_stream_with_multiple_signed_reasoning_blocks(agenerator, alist):
+    """Each signed reasoning block keeps only its own signature.
+
+    Guards against https://github.com/strands-agents/harness-sdk/issues/3425: the signature accumulator
+    was never cleared when a reasoning block finalized, so later blocks carried a cumulative concatenation
+    ("SIG1", "SIG1SIG2", ...) that providers reject as a modified thinking signature on the next request.
+    """
+    response = [
+        {"messageStart": {"role": "assistant"}},
+        {"contentBlockDelta": {"delta": {"reasoningContent": {"text": "first"}}, "contentBlockIndex": 0}},
+        {"contentBlockDelta": {"delta": {"reasoningContent": {"signature": "SIG1"}}, "contentBlockIndex": 0}},
+        {"contentBlockStop": {"contentBlockIndex": 0}},
+        {"contentBlockDelta": {"delta": {"reasoningContent": {"text": "second"}}, "contentBlockIndex": 1}},
+        {"contentBlockDelta": {"delta": {"reasoningContent": {"signature": "SIG2"}}, "contentBlockIndex": 1}},
+        {"contentBlockStop": {"contentBlockIndex": 1}},
+        {"messageStop": {"stopReason": "end_turn"}},
+    ]
+
+    stream = strands.event_loop.streaming.process_stream(agenerator(response))
+
+    last_event = cast(ModelStopReason, (await alist(stream))[-1])
+
+    message = _get_message_from_event(last_event)
+
+    tru_signatures = [block["reasoningContent"]["reasoningText"]["signature"] for block in message["content"]]
+    exp_signatures = ["SIG1", "SIG2"]
+    assert tru_signatures == exp_signatures
+
+
+@pytest.mark.asyncio
+async def test_process_stream_signature_does_not_leak_into_later_empty_block(agenerator, alist):
+    """A signed reasoning block does not turn a later empty content block into a spurious reasoning block.
+
+    Guards against the secondary effect of https://github.com/strands-agents/harness-sdk/issues/3425: a stale
+    signature left in state kept the ``"signature" in state`` guard true, so an otherwise-empty trailing block
+    was materialized as a reasoning block carrying the leaked signature.
+    """
+    response = [
+        {"messageStart": {"role": "assistant"}},
+        {"contentBlockDelta": {"delta": {"reasoningContent": {"text": "thinking"}}, "contentBlockIndex": 0}},
+        {"contentBlockDelta": {"delta": {"reasoningContent": {"signature": "SIG1"}}, "contentBlockIndex": 0}},
+        {"contentBlockStop": {"contentBlockIndex": 0}},
+        {"contentBlockStart": {"start": {}, "contentBlockIndex": 1}},
+        {"contentBlockStop": {"contentBlockIndex": 1}},
+        {"messageStop": {"stopReason": "end_turn"}},
+    ]
+
+    stream = strands.event_loop.streaming.process_stream(agenerator(response))
+
+    last_event = cast(ModelStopReason, (await alist(stream))[-1])
+
+    message = _get_message_from_event(last_event)
+
+    tru_content = message["content"]
+    exp_content = [{"reasoningContent": {"reasoningText": {"text": "thinking", "signature": "SIG1"}}}]
+    assert tru_content == exp_content
+
+
+@pytest.mark.asyncio
 async def test_stream_messages(agenerator, alist):
     mock_model = unittest.mock.MagicMock()
     mock_model.stream.return_value = agenerator(
@@ -1219,7 +1473,43 @@ async def test_stream_messages(agenerator, alist):
         system_prompt_content=[{"text": "test prompt"}],
         invocation_state=None,
         model_state=None,
+        cancel_signal=None,
+        agent_metadata=None,
     )
+
+
+@pytest.mark.asyncio
+async def test_stream_messages_strips_id_before_model_call(agenerator, alist):
+    """The durable message id must never leak to the model provider."""
+    mock_model = unittest.mock.MagicMock()
+    mock_model.stream.return_value = agenerator(
+        [
+            {"contentBlockDelta": {"delta": {"text": "test"}}},
+            {"contentBlockStop": {}},
+        ]
+    )
+
+    stream = strands.event_loop.streaming.stream_messages(
+        mock_model,
+        system_prompt_content=None,
+        messages=[
+            {
+                "role": "user",
+                "content": [{"text": "hi"}],
+                "tracking_id": "durable-1",
+                "metadata": {"usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}},
+            }
+        ],
+        tool_specs=None,
+        system_prompt=None,
+    )
+
+    await alist(stream)
+
+    sent_messages = mock_model.stream.call_args[0][0]
+    assert sent_messages == [{"role": "user", "content": [{"text": "hi"}]}]
+    assert "tracking_id" not in sent_messages[0]
+    assert "metadata" not in sent_messages[0]
 
 
 @pytest.mark.asyncio
@@ -1254,6 +1544,8 @@ async def test_stream_messages_with_system_prompt_content(agenerator, alist):
         system_prompt_content=system_prompt_content,
         invocation_state=None,
         model_state=None,
+        cancel_signal=None,
+        agent_metadata=None,
     )
 
 
@@ -1289,6 +1581,8 @@ async def test_stream_messages_single_text_block_backwards_compatibility(agenera
         system_prompt_content=system_prompt_content,
         invocation_state=None,
         model_state=None,
+        cancel_signal=None,
+        agent_metadata=None,
     )
 
 
@@ -1322,6 +1616,8 @@ async def test_stream_messages_empty_system_prompt_content(agenerator, alist):
         system_prompt_content=[],
         invocation_state=None,
         model_state=None,
+        cancel_signal=None,
+        agent_metadata=None,
     )
 
 
@@ -1355,6 +1651,8 @@ async def test_stream_messages_none_system_prompt_content(agenerator, alist):
         system_prompt_content=None,
         invocation_state=None,
         model_state=None,
+        cancel_signal=None,
+        agent_metadata=None,
     )
 
     # Ensure that we're getting typed events coming out of process_stream
@@ -1524,3 +1822,134 @@ async def test_complete_event_with_multiple_text_blocks(agenerator, alist):
 
     complete_events = [e for e in events if e.get("complete") is True]
     assert len(complete_events) == 2, f"Expected 2 complete events (one per text block), got {len(complete_events)}"
+
+
+def test_handle_content_block_delta_captures_tool_use_id_and_name_from_delta():
+    """Delta events that include toolUseId and name should populate current_tool_use."""
+    event = {"delta": {"toolUse": {"input": '{"x": 1}', "toolUseId": "abc123", "name": "output_slide"}}}
+    state = {"current_tool_use": {}}
+
+    updated_state, _ = strands.event_loop.streaming.handle_content_block_delta(event, state)
+
+    assert updated_state["current_tool_use"] == {
+        "toolUseId": "abc123",
+        "name": "output_slide",
+        "input": '{"x": 1}',
+    }
+
+
+def test_handle_content_block_delta_does_not_override_existing_tool_use_id_and_name():
+    """toolUseId and name from contentBlockStart should not be overridden by a later delta."""
+    event = {"delta": {"toolUse": {"input": '{"x": 1}', "toolUseId": "from_delta", "name": "from_delta"}}}
+    state = {"current_tool_use": {"toolUseId": "from_start", "name": "from_start", "input": ""}}
+
+    updated_state, _ = strands.event_loop.streaming.handle_content_block_delta(event, state)
+
+    assert updated_state["current_tool_use"] == {
+        "toolUseId": "from_start",
+        "name": "from_start",
+        "input": '{"x": 1}',
+    }
+
+
+def test_handle_content_block_delta_tool_use_without_input_key():
+    """A toolUse delta missing the input key should not raise KeyError."""
+    event = {"delta": {"toolUse": {}}}
+    state = {"current_tool_use": {"toolUseId": "t1", "name": "tool"}}
+
+    updated_state, _ = strands.event_loop.streaming.handle_content_block_delta(event, state)
+
+    assert updated_state["current_tool_use"]["input"] == ""
+
+
+def test_handle_content_block_stop_skips_incomplete_tool_use_missing_id(caplog):
+    """A tool use block missing toolUseId is skipped with a warning."""
+    import logging
+
+    state = {
+        "content": [],
+        "current_tool_use": {"name": "output_slide", "input": '{"x": 1}'},
+        "text": "",
+        "reasoningText": "",
+        "citationsContent": [],
+    }
+
+    with caplog.at_level(logging.WARNING, logger="strands.event_loop.streaming"):
+        updated_state = strands.event_loop.streaming.handle_content_block_stop(state)
+
+    assert updated_state["content"] == []
+    assert updated_state["current_tool_use"] == {}
+    assert "incomplete tool use block" in caplog.text
+
+
+def test_handle_content_block_stop_skips_incomplete_tool_use_missing_name(caplog):
+    """A tool use block missing name is skipped with a warning."""
+    import logging
+
+    state = {
+        "content": [],
+        "current_tool_use": {"toolUseId": "abc123", "input": '{"x": 1}'},
+        "text": "",
+        "reasoningText": "",
+        "citationsContent": [],
+    }
+
+    with caplog.at_level(logging.WARNING, logger="strands.event_loop.streaming"):
+        updated_state = strands.event_loop.streaming.handle_content_block_stop(state)
+
+    assert updated_state["content"] == []
+    assert updated_state["current_tool_use"] == {}
+    assert "incomplete tool use block" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_process_stream_tool_use_info_in_delta(agenerator, alist):
+    """Models that provide toolUseId and name in contentBlockDelta (not contentBlockStart) work correctly."""
+    response = [
+        {"messageStart": {"role": "assistant"}},
+        {"contentBlockStart": {"start": {}}},
+        {
+            "contentBlockDelta": {
+                "delta": {"toolUse": {"input": '{"title": "Test"}', "toolUseId": "xyz789", "name": "output_slide"}}
+            }
+        },
+        {"contentBlockStop": {}},
+        {"messageStop": {"stopReason": "tool_use"}},
+        {
+            "metadata": {
+                "usage": {"inputTokens": 5, "outputTokens": 10, "totalTokens": 15},
+                "metrics": {"latencyMs": 50},
+            }
+        },
+    ]
+
+    stream = strands.event_loop.streaming.process_stream(agenerator(response))
+    events = await alist(stream)
+    last_event = cast(ModelStopReason, events[-1])
+
+    stop_reason, message, _, _ = last_event["stop"]
+    assert stop_reason == "tool_use"
+    assert len(message["content"]) == 1
+    tool_use = message["content"][0]["toolUse"]
+    assert tool_use == {"toolUseId": "xyz789", "name": "output_slide", "input": {"title": "Test"}}
+
+
+@pytest.mark.asyncio
+async def test_stream_messages_forwards_cancel_signal_to_model(agenerator, alist):
+    """The model receives the exact cancellation event the SDK checkpoints on."""
+    mock_model = unittest.mock.MagicMock()
+    mock_model.stream.return_value = agenerator([{"contentBlockStop": {}}])
+    cancel_signal = threading.Event()
+
+    stream = strands.event_loop.streaming.stream_messages(
+        mock_model,
+        system_prompt=None,
+        messages=[{"role": "user", "content": [{"text": "Hello"}]}],
+        tool_specs=None,
+        system_prompt_content=None,
+        cancel_signal=cancel_signal,
+    )
+
+    await alist(stream)
+
+    assert mock_model.stream.call_args.kwargs["cancel_signal"] is cancel_signal

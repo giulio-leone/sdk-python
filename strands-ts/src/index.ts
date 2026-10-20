@@ -13,7 +13,9 @@ export { StateStore } from './state-store.js'
 
 // Agent types
 export { AgentResult } from './types/agent.js'
+export type { AgentMetadata } from './agent/agent-metadata.js'
 export type { AgentConfig, ToolList, ToolExecutorStrategy } from './agent/agent.js'
+export type { BackgroundTasksConfig } from './background-tasks/types.js'
 export type { AgentAsToolOptions } from './agent/agent-as-tool.js'
 export type { ToolCaller, ToolCallerProxy, ToolHandle, DirectToolCallOptions } from './agent/tool-caller.js'
 export type { InvocationState, InvokeArgs, InvokeOptions, LocalAgent } from './types/agent.js'
@@ -38,12 +40,16 @@ export {
   StructuredOutputError,
   ToolNotFoundError,
   DefaultNotConfiguredError,
+  StorageError,
 } from './errors.js'
 
 // Interrupt system
+export { InterruptError } from './interrupt.js'
 export type { Interrupt, InterruptSource } from './interrupt.js'
 export type { InterruptParams, InterruptResponse, InterruptResponseContentData } from './types/interrupt.js'
 export { InterruptResponseContent } from './types/interrupt.js'
+
+// Checkpoint APIs are experimental; see '@strands-agents/sdk/experimental'.
 
 // JSON types
 export type { JSONSchema, JSONValue } from './types/json.js'
@@ -99,12 +105,16 @@ export type {
 export { CitationsBlock } from './types/citations.js'
 
 // Media classes
-export { S3Location, ImageBlock, VideoBlock, DocumentBlock } from './types/media.js'
+export { S3Location, AudioBlock, ImageBlock, VideoBlock, DocumentBlock } from './types/media.js'
 
 // Media types
 export type {
   LocationData,
   S3LocationData,
+  AudioFormat,
+  AudioSource,
+  AudioSourceData,
+  AudioBlockData,
   ImageFormat,
   ImageSource,
   ImageSourceData,
@@ -140,6 +150,10 @@ export type { ZodToolConfig } from './tools/zod-tool.js'
 
 // Tool factory function
 export { tool } from './tools/tool-factory.js'
+
+// Tool executors
+export { ConcurrentToolExecutor } from './tools/executors/concurrent.js'
+export { SequentialToolExecutor } from './tools/executors/sequential.js'
 
 // Streaming event types
 export type {
@@ -179,6 +193,22 @@ export {
 export type { BaseModelConfig, CountTokensOptions, StreamOptions, CacheConfig } from './models/model.js'
 
 export { Model } from './models/model.js'
+
+// Decision models
+export { DecisionModel, defineQuestions, LLMDecisionModel, Uncertain } from './decisions/index.js'
+export type { AnswerOf, DecisionInput, DecisionResult, LLMDecisionModelOptions, Question } from './decisions/index.js'
+
+// Model routing
+export { ClassifierStrategy, FallbackStrategy, ModelRouter, RoutingCandidate } from './models/routing/index.js'
+export type {
+  CandidateInput,
+  ClassifierStrategyOptions,
+  ModelRouterOptions,
+  RoutingAttempt,
+  RoutingCandidateOptions,
+  RoutingContext,
+  RoutingStrategy,
+} from './models/routing/index.js'
 
 // Bedrock model provider
 export { BedrockModel as BedrockModel } from './models/bedrock.js'
@@ -252,6 +282,19 @@ export {
   type RetryDecision,
 } from './retry/index.js'
 
+// Context Manager (experimental)
+export type { ContextManagerStrategy } from './context-manager/context-manager.js'
+export type { ContextManagerConfig, ContextStrategy, ContextState, StashConfig } from './context-manager/types.js'
+export { Offload } from './context-manager/strategies/offload/index.js'
+export type {
+  OffloadTarget,
+  OffloadConditions,
+  OffloadStrategyBuilder,
+} from './context-manager/strategies/offload/index.js'
+export type { TruncateConfig } from './context-manager/methods/truncate.js'
+export type { SummarizeConfig } from './context-manager/methods/summarize.js'
+export type { StrategyPresetName } from './context-manager/presets.js'
+
 // Conversation Manager
 export {
   ConversationManager,
@@ -276,14 +319,26 @@ export type { Logger } from './logging/types.js'
 // MCP Client types and implementations
 export {
   type McpClientOptions,
+  type McpListOptions,
+  type McpListToolsOptions,
+  type McpProgress,
+  type McpProgressCallback,
+  type McpToolFilterCallback,
+  type McpToolFilters,
+  type McpToolMatcher,
   type McpClientConfig,
   type McpClientCredentials,
   type McpTransport,
   type McpCallToolOptions,
   type TasksConfig,
   type McpConnectionState,
+  type McpLoadServersOptions,
+  type McpServerConfig,
+  type SerializableMcpToolFilters,
   McpClient,
-} from './mcp.js'
+  McpTaskCancelledError,
+  McpTaskFailedError,
+} from './mcp/index.js'
 export type { ElicitationCallback, ElicitationContext } from './types/elicitation.js'
 
 // Session management
@@ -302,6 +357,9 @@ export { AgentTrace } from './telemetry/tracer.js'
 
 // Local Metrics
 export { AgentMetrics } from './telemetry/meter.js'
+
+// Storage
+export type { Storage } from './storage/storage.js'
 
 // Sandbox
 export { Sandbox, type ExecuteOptions } from './sandbox/base.js'
@@ -361,3 +419,27 @@ export type {
   IntervalTriggerOptions,
   ModelExtractorOptions,
 } from './memory/index.js'
+
+export type { McpTaskRequestOptions } from './mcp/index.js'
+export type {
+  McpSubmitToolResult,
+  McpCancelTaskResult,
+  McpCancelledTask,
+  McpCompletedTask,
+  McpCreateTaskResult,
+  McpDetailedTask,
+  McpDirectCallToolResult,
+  McpFailedTask,
+  McpGetTaskResult,
+  McpInputRequest,
+  McpInputRequests,
+  McpInputRequiredTask,
+  McpInputResponse,
+  McpInputResponses,
+  McpTask,
+  McpTaskError,
+  McpTaskResult,
+  McpTaskStatus,
+  McpUpdateTaskResult,
+  McpWorkingTask,
+} from './mcp/index.js'

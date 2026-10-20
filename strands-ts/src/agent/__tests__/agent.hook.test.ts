@@ -25,6 +25,7 @@ import { Message, TextBlock, ToolResultBlock } from '../../types/messages.js'
 import type { Plugin } from '../../plugins/plugin.js'
 import type { LocalAgent } from '../../types/agent.js'
 import type { Tool } from '../../tools/tool.js'
+import { anyTrackingId } from '../../__fixtures__/message-helpers.js'
 
 describe('Agent Hooks Integration', () => {
   let mockPlugin: MockPlugin
@@ -48,7 +49,11 @@ describe('Agent Hooks Integration', () => {
       expect(lifecyclePlugin.invocations[2]).toEqual(
         new MessageAddedEvent({
           agent,
-          message: new Message({ role: 'user', content: [new TextBlock('Hi')] }),
+          message: new Message({
+            role: 'user',
+            content: [new TextBlock('Hi')],
+            trackingId: anyTrackingId,
+          }),
           invocationState: {},
         })
       )
@@ -68,14 +73,22 @@ describe('Agent Hooks Integration', () => {
           attemptCount: 1,
           stopData: {
             stopReason: 'endTurn',
-            message: new Message({ role: 'assistant', content: [new TextBlock('Hello')] }),
+            message: new Message({
+              role: 'assistant',
+              content: [new TextBlock('Hello')],
+              trackingId: anyTrackingId,
+            }),
           },
         })
       )
       expect(lifecyclePlugin.invocations[5]).toEqual(
         new MessageAddedEvent({
           agent,
-          message: new Message({ role: 'assistant', content: [new TextBlock('Hello')] }),
+          message: new Message({
+            role: 'assistant',
+            content: [new TextBlock('Hello')],
+            trackingId: anyTrackingId,
+          }),
           invocationState: {},
         })
       )
@@ -96,7 +109,11 @@ describe('Agent Hooks Integration', () => {
       expect(lifecyclePlugin.invocations[2]).toEqual(
         new MessageAddedEvent({
           agent,
-          message: new Message({ role: 'user', content: [new TextBlock('Hi')] }),
+          message: new Message({
+            role: 'user',
+            content: [new TextBlock('Hi')],
+            trackingId: anyTrackingId,
+          }),
           invocationState: {},
         })
       )
@@ -116,14 +133,22 @@ describe('Agent Hooks Integration', () => {
           attemptCount: 1,
           stopData: {
             stopReason: 'endTurn',
-            message: new Message({ role: 'assistant', content: [new TextBlock('Hello')] }),
+            message: new Message({
+              role: 'assistant',
+              content: [new TextBlock('Hello')],
+              trackingId: anyTrackingId,
+            }),
           },
         })
       )
       expect(lifecyclePlugin.invocations[5]).toEqual(
         new MessageAddedEvent({
           agent,
-          message: new Message({ role: 'assistant', content: [new TextBlock('Hello')] }),
+          message: new Message({
+            role: 'assistant',
+            content: [new TextBlock('Hello')],
+            trackingId: anyTrackingId,
+          }),
           invocationState: {},
         })
       )
@@ -330,14 +355,22 @@ describe('Agent Hooks Integration', () => {
       expect(messageAddedEvents[0]).toEqual(
         new MessageAddedEvent({
           agent,
-          message: new Message({ role: 'user', content: [new TextBlock('New message')] }),
+          message: new Message({
+            role: 'user',
+            content: [new TextBlock('New message')],
+            trackingId: anyTrackingId,
+          }),
           invocationState: {},
         })
       )
       expect(messageAddedEvents[1]).toEqual(
         new MessageAddedEvent({
           agent,
-          message: new Message({ role: 'assistant', content: [new TextBlock('Response')] }),
+          message: new Message({
+            role: 'assistant',
+            content: [new TextBlock('Response')],
+            trackingId: anyTrackingId,
+          }),
           invocationState: {},
         })
       )
@@ -465,6 +498,67 @@ describe('Agent Hooks Integration', () => {
       expect(result.stopReason).toBe('endTurn')
       expect(toolCallCount).toBe(2)
       expect(hookCallCount).toBe(2)
+    })
+
+    it('does not retry a tool call after agent cancellation', async () => {
+      let toolCallCount = 0
+      const tool = createMockTool('cancelledTool', () => {
+        toolCallCount++
+        return new ToolResultBlock({
+          toolUseId: 'tool-1',
+          status: 'error',
+          content: [new TextBlock('Cancelled locally')],
+        })
+      })
+
+      const model = new MockMessageModel()
+        .addTurn({ type: 'toolUseBlock', name: 'cancelledTool', toolUseId: 'tool-1', input: {} })
+        .addTurn({ type: 'textBlock', text: 'Should not reach' })
+
+      const agent = new Agent({ model, tools: [tool] })
+      let hookCallCount = 0
+      agent.addHook(AfterToolCallEvent, (event: AfterToolCallEvent) => {
+        hookCallCount++
+        if (hookCallCount === 1) {
+          agent.cancel()
+          event.retry = true
+        }
+      })
+
+      const result = await agent.invoke('Test')
+
+      expect(result.stopReason).toBe('cancelled')
+      expect(toolCallCount).toBe(1)
+      expect(hookCallCount).toBe(1)
+    })
+
+    it('does not retry a hook-cancelled tool after agent cancellation', async () => {
+      let toolCallCount = 0
+      const tool = createMockTool('cancelledTool', () => {
+        toolCallCount++
+        return new ToolResultBlock({ toolUseId: 'tool-1', status: 'success', content: [new TextBlock('Success')] })
+      })
+
+      const model = new MockMessageModel()
+        .addTurn({ type: 'toolUseBlock', name: 'cancelledTool', toolUseId: 'tool-1', input: {} })
+        .addTurn({ type: 'textBlock', text: 'Should not reach' })
+
+      const agent = new Agent({ model, tools: [tool] })
+      agent.addHook(BeforeToolCallEvent, (event: BeforeToolCallEvent) => {
+        event.cancel = true
+      })
+      let hookCallCount = 0
+      agent.addHook(AfterToolCallEvent, (event: AfterToolCallEvent) => {
+        hookCallCount++
+        agent.cancel()
+        event.retry = true
+      })
+
+      const result = await agent.invoke('Test')
+
+      expect(result.stopReason).toBe('cancelled')
+      expect(toolCallCount).toBe(0)
+      expect(hookCallCount).toBe(1)
     })
 
     it('does not retry tool call when retry is not set', async () => {
@@ -970,6 +1064,57 @@ describe('Agent Hooks Integration', () => {
         })
       )
       expect(model.callCount).toBe(2)
+    })
+
+    it('treats empty array endTurn as falsy (does not halt)', async () => {
+      const { tool, model } = makeSingleToolSetup()
+      const agent = new Agent({ model, tools: [tool] })
+      agent.addHook(AfterToolsEvent, (event: AfterToolsEvent) => {
+        event.endTurn = []
+      })
+
+      const result = await agent.invoke('Test')
+
+      expect(result).toEqual(
+        expect.objectContaining({
+          type: 'agentResult',
+          stopReason: 'endTurn',
+          lastMessage: expect.objectContaining({ role: 'assistant' }),
+        })
+      )
+      expect(model.callCount).toBe(2)
+    })
+
+    it('halts with content blocks when endTurn is a ContentBlock array', async () => {
+      const { tool, model } = makeSingleToolSetup()
+      const agent = new Agent({ model, tools: [tool] })
+      agent.addHook(AfterToolsEvent, (event: AfterToolsEvent) => {
+        event.endTurn = [new TextBlock('delegated response')]
+      })
+
+      const result = await agent.invoke('Test')
+
+      expect(result.stopReason).toBe('endTurn')
+      expect(result.lastMessage.content).toEqual([new TextBlock('delegated response')])
+      expect(agent.messages.at(-1)!.content).toEqual([new TextBlock('delegated response')])
+      expect(model.callCount).toBe(1)
+    })
+
+    it('shallow-copies the endTurn array so later mutation does not affect history', async () => {
+      const { tool, model } = makeSingleToolSetup()
+      const agent = new Agent({ model, tools: [tool] })
+      const hookList = [new TextBlock('from hook')]
+      agent.addHook(AfterToolsEvent, (event: AfterToolsEvent) => {
+        event.endTurn = hookList
+      })
+
+      await agent.invoke('Test')
+
+      // Mutate the hook's list after the invocation returns
+      hookList.push(new TextBlock('MUTATED AFTER THE FACT'))
+
+      // The committed message must be unchanged — the event loop shallow-copied
+      expect(agent.messages.at(-1)!.content).toEqual([new TextBlock('from hook')])
     })
 
     it('appends tool results and default endTurn message to conversation history', async () => {
@@ -1684,6 +1829,22 @@ describe('Agent Hooks Integration', () => {
       await agent.invoke('Hi')
 
       expect(queue).toHaveLength(0)
+    })
+  })
+
+  describe('plugin initialization failure', () => {
+    it('keeps a plugin initialization failure fail-closed across retries', async () => {
+      const initializationError = new Error('plugin initialization failed')
+      const plugin: Plugin = {
+        name: 'failing-plugin',
+        initAgent: () => {
+          throw initializationError
+        },
+      }
+      const agent = new Agent({ model: new MockMessageModel(), plugins: [plugin] })
+
+      await expect(agent.initialize()).rejects.toBe(initializationError)
+      await expect(agent.initialize()).rejects.toBe(initializationError)
     })
   })
 })

@@ -2,10 +2,14 @@ import logging
 import unittest.mock
 from typing import Any
 
+import pydantic
 import pytest
+import writerai
 
 import strands
+from strands.models.model import CacheConfig
 from strands.models.writer import WriterModel
+from strands.types.exceptions import ContextWindowOverflowException
 
 
 @pytest.fixture
@@ -49,6 +53,14 @@ def messages():
 @pytest.fixture
 def system_prompt():
     return "System prompt"
+
+
+@pytest.fixture
+def test_output_model_cls():
+    class TestOutputModel(pydantic.BaseModel):
+        name: str
+
+    return TestOutputModel
 
 
 def test__init__(writer_client_cls, model_id, stream_options, client_args):
@@ -566,3 +578,108 @@ def test_format_request_filters_location_source_document(model, caplog):
     assert len(user_content) == 1
     assert user_content[0]["type"] == "text"
     assert "Location sources are not supported by Writer" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "overflow_message",
+    [
+        "This model's maximum context length is 32768 tokens",
+        "prompt is too long",
+        "too many tokens in request",
+    ],
+)
+@pytest.mark.asyncio
+async def test_stream_context_overflow_error(overflow_message, writer_client, model, alist):
+    error = writerai.BadRequestError(overflow_message, response=unittest.mock.Mock(), body=None)
+    writer_client.chat.chat = unittest.mock.AsyncMock(side_effect=error)
+
+    messages = [{"role": "user", "content": [{"text": "test"}]}]
+    with pytest.raises(ContextWindowOverflowException) as exc_info:
+        await alist(model.stream(messages))
+
+    assert overflow_message in str(exc_info.value)
+    assert exc_info.value.__cause__ == error
+
+
+@pytest.mark.asyncio
+async def test_stream_non_overflow_bad_request_propagates(writer_client, model, alist):
+    error = writerai.BadRequestError("invalid 'model' parameter", response=unittest.mock.Mock(), body=None)
+    writer_client.chat.chat = unittest.mock.AsyncMock(side_effect=error)
+
+    messages = [{"role": "user", "content": [{"text": "test"}]}]
+    with pytest.raises(writerai.BadRequestError, match="invalid 'model' parameter"):
+        await alist(model.stream(messages))
+
+
+@pytest.mark.asyncio
+async def test_structured_output_context_overflow_error(writer_client, model, test_output_model_cls, alist):
+    error = writerai.BadRequestError(
+        "This model's maximum context length is 32768 tokens", response=unittest.mock.Mock(), body=None
+    )
+    writer_client.chat.chat = unittest.mock.AsyncMock(side_effect=error)
+
+    messages = [{"role": "user", "content": [{"text": "test"}]}]
+    with pytest.raises(ContextWindowOverflowException) as exc_info:
+        await alist(model.structured_output(test_output_model_cls, messages))
+
+    assert "maximum context length" in str(exc_info.value)
+    assert exc_info.value.__cause__ == error
+
+
+@pytest.mark.asyncio
+async def test_structured_output_non_overflow_bad_request_propagates(
+    writer_client, model, test_output_model_cls, alist
+):
+    error = writerai.BadRequestError("invalid 'model' parameter", response=unittest.mock.Mock(), body=None)
+    writer_client.chat.chat = unittest.mock.AsyncMock(side_effect=error)
+
+    messages = [{"role": "user", "content": [{"text": "test"}]}]
+    with pytest.raises(writerai.BadRequestError, match="invalid 'model' parameter"):
+        await alist(model.structured_output(test_output_model_cls, messages))
+
+
+def test_cache_config_round_trips(writer_client, model_id, captured_warnings):
+    """cache_config is a valid config field and survives get_config/update_config unchanged."""
+    _ = writer_client
+    cache_config = CacheConfig()
+    model = WriterModel(model_id=model_id, cache_config=cache_config)
+
+    assert model.get_config()["cache_config"] is cache_config
+
+    updated = CacheConfig()
+    model.update_config(cache_config=updated)
+    assert model.get_config()["cache_config"] is updated
+
+    assert not any("Invalid configuration parameters" in str(warning.message) for warning in captured_warnings)
+
+
+def test_cache_config_default_is_silent_and_not_routed(writer_client, model_id, messages, captured_warnings):
+    """A CacheConfig whose fields are all default warns about nothing and never reaches the request."""
+    _ = writer_client
+    model = WriterModel(model_id=model_id, cache_config=CacheConfig(strategy="auto"))
+
+    request = model.format_request(messages)
+
+    assert "cache_config" not in request
+    assert not any("have no effect" in str(warning.message) for warning in captured_warnings)
+
+
+@pytest.mark.parametrize(
+    ("cache_config", "field"),
+    [
+        (CacheConfig(strategy="anthropic"), "strategy"),
+        (CacheConfig(ttl="1h"), "ttl"),
+        (CacheConfig(system_prompt_ttl="1h"), "system_prompt_ttl"),
+        (CacheConfig(cache_key="tenant-42"), "cache_key"),
+        (CacheConfig(tools_ttl=True), "tools_ttl"),
+    ],
+)
+def test_cache_config_unsupported_field_warns_and_is_not_routed(writer_client, model_id, messages, cache_config, field):
+    """Writer honors no cache field: a non-default field warns (naming the provider) and never reaches the request."""
+    _ = writer_client
+    model = WriterModel(model_id=model_id, cache_config=cache_config)
+
+    with pytest.warns(UserWarning, match=rf"fields \['{field}'\] have no effect on Writer"):
+        request = model.format_request(messages)
+
+    assert "cache_config" not in request

@@ -1,5 +1,6 @@
 // @ts-check
 import { defineConfig } from 'astro/config'
+import { unified } from '@astrojs/markdown-remark'
 import starlight from '@astrojs/starlight'
 import path from 'node:path'
 import remarkMkdocsSnippets from './src/plugins/remark-mkdocs-snippets.ts'
@@ -8,6 +9,7 @@ import remarkReadingTime from './src/plugins/remark-reading-time.ts'
 import watchNavigationPlugin from './src/plugins/vite-plugin-watch-navigation.ts'
 
 import { loadSidebarFromConfig } from "./src/sidebar.ts"
+import { buildStaticRedirects } from "./src/util/redirect.static.ts"
 import { sitemapWithLastmod } from "./src/plugins/sitemap-lastmod.ts"
 import AutoImport from './src/plugins/astro-auto-import.ts'
 import astroExpressiveCode from "astro-expressive-code"
@@ -21,10 +23,21 @@ const sidebar = loadSidebarFromConfig(
   path.resolve('./src/content')
 )
 
+const base = process.env.ASTRO_BASE_PATH || '/'
+// Absolute URLs (canonical, og:image) use this origin, so a preview build points them at its own host.
+const site = (process.env.SITE_DOMAIN || 'https://strandsagents.com').replace(/\/$/, '')
+
+// Static HTML redirect stubs for known legacy MkDocs URLs (meta refresh +
+// canonical link), so crawlers follow renames that the client-side 404
+// fallback only handles for humans. Dynamic legacy URLs (/latest/*, /1.x/*)
+// can't be enumerated and stay with the 404 fallback (Redirect404.astro).
+const redirects = buildStaticRedirects(path.resolve('./src/content'), base)
+
 // https://astro.build/config
 export default defineConfig({
-  site: 'https://strandsagents.com',
-  base: process.env.ASTRO_BASE_PATH || '/',
+  site,
+  base,
+  redirects,
   vite: {
     plugins: [sdkSetupPlugin(), watchNavigationPlugin()],
     // TODO once we separate out CMS build from TS verification, fix this
@@ -34,6 +47,7 @@ export default defineConfig({
 		},
 	},
   markdown: {
+    processor: unified(),
     remarkPlugins: [remarkMkdocsSnippets, remarkReadingTime],
   },
   integrations: [
@@ -55,8 +69,15 @@ export default defineConfig({
     starlight({
       social: [],
       head: [
-        { tag: 'meta', attrs: { property: 'og:image', content: 'https://strandsagents.com/og-image.png' } },
-        { tag: 'meta', attrs: { name: 'twitter:image', content: 'https://strandsagents.com/og-image.png' } },
+        { tag: 'meta', attrs: { property: 'og:image', content: `${site}/og-image.png` } },
+        { tag: 'meta', attrs: { property: 'og:image:width', content: '1200' } },
+        { tag: 'meta', attrs: { property: 'og:image:height', content: '630' } },
+        { tag: 'meta', attrs: { property: 'og:image:alt', content: 'Strands Agents — the open source toolkit for production agents' } },
+        { tag: 'meta', attrs: { name: 'twitter:image', content: `${site}/og-image.png` } },
+        // Keep preview hosts out of search, since their canonical URLs point at themselves.
+        ...(site === 'https://strandsagents.com'
+          ? []
+          : [{ tag: 'meta', attrs: { name: 'robots', content: 'noindex, nofollow' } }]),
       ],
       markdown: {
         // API docs are symlinked from .build/api-docs; processedDirs ensures Starlight's
@@ -66,9 +87,15 @@ export default defineConfig({
       title: 'Strands Agents',
       description: 'The open source toolkit for building production agents.',
       sidebar: sidebar,
+      tableOfContents: {
+        minHeadingLevel: 2,
+        maxHeadingLevel: 3,
+      },
       routeMiddleware: './src/route-middleware.ts',
       customCss: [
         './src/styles/custom.css',
+        './src/styles/fonts.css',
+        './src/styles/diagrams.css',
       ],
       logo: {
         light: './src/assets/logo-light.svg',
@@ -80,9 +107,11 @@ export default defineConfig({
       },
       components: {
         Head: './src/components/overrides/Head.astro',
-        Header: './src/components/overrides/Header.astro',
+        Header: './src/components/Header.astro',
         Hero: './src/components/overrides/Hero.astro',
         MarkdownContent: './src/components/overrides/MarkdownContent.astro',
+        PageTitle: './src/components/overrides/PageTitle.astro',
+        PageSidebar: './src/components/overrides/PageSidebar.astro',
         Sidebar: './src/components/overrides/Sidebar.astro',
         PageFrame: './src/components/overrides/PageFrame.astro',
       },
@@ -91,7 +120,7 @@ export default defineConfig({
       checkExternalLinks: false,      // Optional: check external links (default: false)
       cacheExternalLinks: false,      // Optional: cache verified external links to disk (default: true)
       throwError: true,               // Optional: fail the build if broken links are found (default: false)
-      linkCheckerDir: '.link-checker' // Optional: directory for cache and log files (default: '.link-checker')
+      linkCheckerDir: '.link-checker', // Optional: directory for cache and log files (default: '.link-checker')
     }),
    AutoImport({
       imports: [
@@ -104,7 +133,13 @@ export default defineConfig({
           ],
           './src/components/Syntax.astro': [
             ['default', 'Syntax']
-          ]
+          ],
+          './src/components/CopyPromptButton.astro': [
+            ['default', 'CopyPromptButton']
+          ],
+          '@astro-community/astro-embed-youtube': [
+            ['YouTube', 'YouTube']
+          ],
         },
       ],
       defaultComponents: {

@@ -15,11 +15,16 @@ from pydantic import BaseModel
 from typing_extensions import Unpack, override
 
 from ..types.content import ContentBlock, Messages
-from ..types.exceptions import ModelThrottledException
+from ..types.exceptions import ContextWindowOverflowException, ModelThrottledException
 from ..types.streaming import StreamEvent
 from ..types.tools import ToolChoice, ToolResult, ToolSpec, ToolUse
-from ._validation import _has_location_source, validate_config_keys, warn_on_tool_choice_not_supported
-from .model import BaseModelConfig, Model
+from ._validation import (
+    _has_location_source,
+    validate_config_keys,
+    warn_on_cache_config_not_supported,
+    warn_on_tool_choice_not_supported,
+)
+from .model import BaseModelConfig, CacheConfig, Model
 
 logger = logging.getLogger(__name__)
 
@@ -29,12 +34,22 @@ T = TypeVar("T", bound=BaseModel)
 class WriterModel(Model):
     """Writer API model provider implementation."""
 
+    OVERFLOW_MESSAGES = {
+        "this model's maximum context length is",
+        "exceed context limit",
+        "model's maximum context limit",
+        "is longer than the model's context length",
+        "prompt is too long",
+        "too many tokens",
+    }
+
     class WriterConfig(BaseModelConfig, total=False):
         """Configuration options for Writer API.
 
         Attributes:
             model_id: Model name to use (e.g. palmyra-x5, palmyra-x4, etc.).
             max_tokens: Maximum number of tokens to generate.
+            cache_config: Prompt caching settings. Writer honors no cache fields, so any set field is ignored.
             stop: Default stop sequences.
             stream_options: Additional options for streaming.
             temperature: What sampling temperature to use.
@@ -43,6 +58,7 @@ class WriterModel(Model):
 
         model_id: str
         max_tokens: int | None
+        cache_config: CacheConfig | None
         stop: str | list[str] | None
         stream_options: dict[str, Any]
         temperature: float | None
@@ -141,8 +157,9 @@ class WriterModel(Model):
 
         content_blocks = list(
             filter(
-                lambda content: content.get("text")
-                and not any(block_type in content for block_type in ["toolResult", "toolUse"]),
+                lambda content: (
+                    content.get("text") and not any(block_type in content for block_type in ["toolResult", "toolUse"])
+                ),
                 contents,
             )
         )
@@ -269,7 +286,7 @@ class WriterModel(Model):
             The formatted request.
         """
         request = {
-            **{k: v for k, v in self.config.items()},
+            **{k: v for k, v in self.config.items() if k != "cache_config"},
             "messages": self._format_request_messages(messages, system_prompt),
             "stream": True,
         }
@@ -294,6 +311,8 @@ class WriterModel(Model):
                 for tool_spec in tool_specs
             ]
 
+        # Writer applies no CacheConfig fields; warn that any set field is ignored.
+        warn_on_cache_config_not_supported(self.config.get("cache_config"), "Writer", supported=set(), stacklevel=3)
         return request
 
     def format_chunk(self, event: Any) -> StreamEvent:
@@ -384,6 +403,7 @@ class WriterModel(Model):
             Formatted message chunks from the model.
 
         Raises:
+            ContextWindowOverflowException: If the input exceeds the model's context window.
             ModelThrottledException: When the model service is throttling requests from the client.
         """
         warn_on_tool_choice_not_supported(tool_choice)
@@ -397,6 +417,10 @@ class WriterModel(Model):
             response = await self.client.chat.chat(**request)
         except writerai.RateLimitError as e:
             raise ModelThrottledException(str(e)) from e
+        except writerai.BadRequestError as e:
+            if any(message in str(e).lower() for message in self.OVERFLOW_MESSAGES):
+                raise ContextWindowOverflowException(str(e)) from e
+            raise
 
         yield self.format_chunk({"chunk_type": "message_start"})
         yield self.format_chunk({"chunk_type": "content_block_start", "data_type": "text"})
@@ -451,6 +475,9 @@ class WriterModel(Model):
             prompt: The prompt messages to use for the agent.
             system_prompt: System prompt to provide context to the model.
             **kwargs: Additional keyword arguments for future extensibility.
+
+        Raises:
+            ContextWindowOverflowException: If the input exceeds the model's context window.
         """
         formatted_request = self.format_request(messages=prompt, tool_specs=None, system_prompt=system_prompt)
         formatted_request["response_format"] = {
@@ -460,7 +487,12 @@ class WriterModel(Model):
         formatted_request["stream"] = False
         formatted_request.pop("stream_options", None)
 
-        response = await self.client.chat.chat(**formatted_request)
+        try:
+            response = await self.client.chat.chat(**formatted_request)
+        except writerai.BadRequestError as e:
+            if any(message in str(e).lower() for message in self.OVERFLOW_MESSAGES):
+                raise ContextWindowOverflowException(str(e)) from e
+            raise
 
         try:
             content = response.choices[0].message.content.strip()

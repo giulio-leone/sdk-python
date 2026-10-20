@@ -1,5 +1,7 @@
 """Tests for the search module."""
 
+import pytest
+
 from strands.vended_plugins.context_offloader.search import _is_searchable_content, _search_content
 
 
@@ -31,20 +33,20 @@ class TestSearchContentLineRangeValidation:
     text = "line 1\nline 2\nline 3\nline 4\nline 5"
 
     def test_start_less_than_one(self):
-        result = _search_content(self.text, line_range=(0, 3), context_lines=5, max_chars=10_000)
-        assert "must be >= 1" in result
+        with pytest.raises(ValueError, match="must be >= 1"):
+            _search_content(self.text, line_range=(0, 3), context_lines=5, max_chars=10_000)
 
     def test_negative_start(self):
-        result = _search_content(self.text, line_range=(-2, 3), context_lines=5, max_chars=10_000)
-        assert "must be >= 1" in result
+        with pytest.raises(ValueError, match="must be >= 1"):
+            _search_content(self.text, line_range=(-2, 3), context_lines=5, max_chars=10_000)
 
     def test_start_greater_than_end(self):
-        result = _search_content(self.text, line_range=(5, 2), context_lines=5, max_chars=10_000)
-        assert "must be <= line_range.end" in result
+        with pytest.raises(ValueError, match="must be <= line_range.end"):
+            _search_content(self.text, line_range=(5, 2), context_lines=5, max_chars=10_000)
 
     def test_start_beyond_total_lines(self):
-        result = _search_content(self.text, line_range=(100, 200), context_lines=5, max_chars=10_000)
-        assert "beyond content length (5 lines)" in result
+        with pytest.raises(ValueError, match=r"beyond content length \(5 lines\)"):
+            _search_content(self.text, line_range=(100, 200), context_lines=5, max_chars=10_000)
 
     def test_clamps_end_to_total_lines(self):
         result = _search_content(self.text, line_range=(3, 999), context_lines=5, max_chars=10_000)
@@ -108,18 +110,14 @@ class TestSearchContentPatternWithLineRange:
     text = "\n".join(f"item {i + 1}" for i in range(30))
 
     def test_searches_only_within_range(self):
-        result = _search_content(
-            self.text, pattern="item 1", line_range=(10, 20), context_lines=0, max_chars=10_000
-        )
+        result = _search_content(self.text, pattern="item 1", line_range=(10, 20), context_lines=0, max_chars=10_000)
         assert "in lines 10-20" in result
         assert "> 10| item 10" in result
         assert "> 11| item 11" in result
         assert "> 1|" not in result
 
     def test_no_matches_within_range(self):
-        result = _search_content(
-            self.text, pattern="item 5", line_range=(10, 20), context_lines=0, max_chars=10_000
-        )
+        result = _search_content(self.text, pattern="item 5", line_range=(10, 20), context_lines=0, max_chars=10_000)
         assert "No matches found" in result
         assert "in lines 10-20" in result
 
@@ -161,6 +159,23 @@ class TestSearchContentTruncation:
         result = _search_content(text, line_range=(1, 2), context_lines=5, max_chars=10_000)
         assert "truncated" not in result
 
+    def test_single_long_line_pattern_result_keeps_body(self):
+        # A body with no internal newlines must still appear when truncated —
+        # the truncator can't mistake the header separator for a body line break.
+        long_json = '{"key":"' + "x" * 5_000 + '"}'
+        result = _search_content(long_json, pattern="key", context_lines=0, max_chars=500)
+        assert "[1 match for /key/]" in result
+        assert '> 1| {"key":"xxxx' in result
+        assert "output truncated, narrow your search" in result
+
+    def test_single_long_line_range_result_keeps_body(self):
+        # Same guarantee on the line-range path: a single long line survives truncation.
+        long_json = '{"key":"' + "x" * 5_000 + '"}'
+        result = _search_content(long_json, line_range=(1, 1), context_lines=0, max_chars=500)
+        assert "[Lines 1-1 of 1]" in result
+        assert '  1| {"key":"xxxx' in result
+        assert "output truncated, narrow your range" in result
+
 
 class TestSearchContentEdgeCases:
     def test_negative_context_lines_clamps_to_zero(self):
@@ -182,6 +197,11 @@ class TestSearchContentEdgeCases:
         text = "foo(bar\nother\nfoo(bar again"
         long_pattern = "foo(bar" + "z" * 200
         result = _search_content(text, pattern=long_pattern, context_lines=0, max_chars=10_000)
+        assert "No matches" in result
+
+    def test_nested_quantifier_falls_back_to_literal(self):
+        text = "aaa hello\nother line"
+        result = _search_content(text, pattern="(a+)+", context_lines=0, max_chars=10_000)
         assert "No matches" in result
 
     def test_empty_indices_format(self):

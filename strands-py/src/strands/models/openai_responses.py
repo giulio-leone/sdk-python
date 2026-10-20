@@ -53,6 +53,7 @@ except Exception as e:
 
 import openai  # noqa: E402 - must import after version check
 
+from ..agent.agent_metadata import AgentMetadata  # noqa: E402
 from ..types.citations import WebLocationDict  # noqa: E402
 from ..types.content import ContentBlock, Messages, Role, SystemContentBlock  # noqa: E402
 from ..types.event_loop import Usage  # noqa: E402
@@ -61,8 +62,10 @@ from ..types.streaming import StreamEvent  # noqa: E402
 from ..types.tools import ToolChoice, ToolResult, ToolSpec, ToolUse  # noqa: E402
 from ._defaults import resolve_config_metadata  # noqa: E402
 from ._openai_bedrock import BedrockMantleConfig, resolve_bedrock_client_args  # noqa: E402
-from ._validation import validate_config_keys  # noqa: E402
-from .model import BaseModelConfig, Model  # noqa: E402
+from ._openai_cache import apply_cache_config  # noqa: E402
+from ._openai_errors import classify_openai_error  # noqa: E402
+from ._validation import _has_location_source, validate_config_keys  # noqa: E402
+from .model import BaseModelConfig, CacheConfig, Model  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +77,14 @@ _MAX_MEDIA_SIZE_LABEL = "20MB"
 _DEFAULT_MIME_TYPE = "application/octet-stream"
 _CONTEXT_WINDOW_OVERFLOW_MSG = "OpenAI Responses API threw context window overflow error"
 _RATE_LIMIT_MSG = "OpenAI Responses API threw rate limit error"
+
+
+class _OpenAIResponsesStreamError(RuntimeError):
+    """Error reported by a terminal OpenAI Responses API stream event."""
+
+    def __init__(self, message: str | None, code: str | None) -> None:
+        super().__init__(message or "OpenAI Responses API response failed")
+        self.code = code
 
 
 def _encode_media_to_data_url(data: bytes, format_ext: str, media_type: str = "image") -> str:
@@ -140,12 +151,17 @@ class OpenAIResponsesModel(Model):
             use_native_token_count: Whether to use the native OpenAI input_tokens.count API.
                 When True, count_tokens() calls the OpenAI API for accurate counts.
                 When False (default), skips the API call and uses the local estimator.
+            cache_config: Prompt-caching configuration. OpenAI routes cache reads on
+                ``cache_key`` (mapped to ``prompt_cache_key``) and honors ``ttl`` only when it names
+                an OpenAI retention value; other fields have no effect. An explicit
+                ``prompt_cache_key``/``prompt_cache_retention`` in ``params`` takes precedence.
         """
 
         model_id: str
         params: dict[str, Any] | None
         stateful: bool
         use_native_token_count: bool
+        cache_config: CacheConfig | None
 
     def __init__(
         self,
@@ -160,9 +176,11 @@ class OpenAIResponsesModel(Model):
                 For a complete list of supported arguments, see https://pypi.org/project/openai/.
                 May be combined with ``bedrock_mantle_config``; when both are set, the config
                 derives ``base_url`` and ``api_key`` (which must not appear in ``client_args``).
-            bedrock_mantle_config: Route requests through Amazon Bedrock's Mantle
-                (OpenAI-compatible) endpoint. See :class:`BedrockMantleConfig` for accepted
-                keys. When set, a fresh bearer token is minted on every request.
+            bedrock_mantle_config: Route requests through one of Amazon Bedrock's
+                OpenAI-compatible endpoints, ``bedrock-mantle`` (the default) or
+                ``bedrock-runtime`` via the config's ``endpoint`` key. See
+                :class:`BedrockMantleConfig` for accepted keys. When set, a fresh bearer
+                token is minted on every request.
             **model_config: Configuration options for the OpenAI Responses API model.
         """
         validate_config_keys(model_config, self.OpenAIResponsesConfig)
@@ -187,7 +205,9 @@ class OpenAIResponsesModel(Model):
         Delegates to :func:`resolve_bedrock_client_args` when ``bedrock_mantle_config`` is set.
         """
         if self._bedrock_mantle_config is not None:
-            return resolve_bedrock_client_args(self._bedrock_mantle_config, self.client_args)
+            return resolve_bedrock_client_args(
+                self._bedrock_mantle_config, self.client_args, model_id=str(self.config.get("model_id", ""))
+            )
         return self.client_args
 
     @property
@@ -282,6 +302,7 @@ class OpenAIResponsesModel(Model):
         *,
         tool_choice: ToolChoice | None = None,
         model_state: dict[str, Any] | None = None,
+        agent_metadata: AgentMetadata | None = None,
         **kwargs: Any,
     ) -> AsyncGenerator[StreamEvent, None]:
         """Stream conversation with the OpenAI Responses API model.
@@ -292,6 +313,7 @@ class OpenAIResponsesModel(Model):
             system_prompt: System prompt to provide context to the model.
             tool_choice: Selection strategy for tool invocation.
             model_state: Runtime state for model providers (e.g., server-side response ids).
+            agent_metadata: Invoking agent's metadata.
             **kwargs: Additional keyword arguments for future extensibility.
 
         Yields:
@@ -302,7 +324,7 @@ class OpenAIResponsesModel(Model):
             ModelThrottledException: If the request is throttled by OpenAI (rate limits).
         """
         logger.debug("formatting request for OpenAI Responses API")
-        request = self._format_request(messages, tool_specs, system_prompt, tool_choice, model_state)
+        request = self._format_request(messages, tool_specs, system_prompt, tool_choice, model_state, agent_metadata)
         logger.debug("formatted request=<%s>", request)
 
         logger.debug("invoking OpenAI Responses API model")
@@ -405,19 +427,32 @@ class OpenAIResponsesModel(Model):
                                         call_info["arguments"] = event.arguments
                                         break
 
+                        elif event.type == "response.failed":
+                            error = getattr(event.response, "error", None)
+                            raise _OpenAIResponsesStreamError(
+                                getattr(error, "message", None), getattr(error, "code", None)
+                            )
+
+                        elif event.type == "error":
+                            raise _OpenAIResponsesStreamError(
+                                getattr(event, "message", None), getattr(event, "code", None)
+                            )
+
                         elif event.type == "response.incomplete":
                             # Response stopped early (e.g., max tokens reached)
                             if hasattr(event, "response"):
                                 if hasattr(event.response, "usage"):
                                     final_usage = event.response.usage
-                                # Check if stopped due to max_output_tokens
-                                if (
-                                    hasattr(event.response, "incomplete_details")
-                                    and event.response.incomplete_details
-                                    and getattr(event.response.incomplete_details, "reason", None)
-                                    == "max_output_tokens"
-                                ):
+                                # Check if stopped due to max_output_tokens or a content filter
+                                incomplete_reason = (
+                                    getattr(event.response.incomplete_details, "reason", None)
+                                    if getattr(event.response, "incomplete_details", None)
+                                    else None
+                                )
+                                if incomplete_reason == "max_output_tokens":
                                     stop_reason = "length"
+                                elif incomplete_reason == "content_filter":
+                                    stop_reason = "content_filter"
                             break
 
                         elif event.type == "response.completed":
@@ -425,13 +460,14 @@ class OpenAIResponsesModel(Model):
                             if hasattr(event, "response") and hasattr(event.response, "usage"):
                                 final_usage = event.response.usage
                             break
-            except openai.APIError as e:
-                if hasattr(e, "code") and e.code == "context_length_exceeded":
-                    logger.warning(_CONTEXT_WINDOW_OVERFLOW_MSG)
-                    raise ContextWindowOverflowException(str(e)) from e
-                if isinstance(e, openai.RateLimitError):
+            except (openai.APIError, _OpenAIResponsesStreamError) as error:
+                error_kind = classify_openai_error(error)
+                if error_kind == "throttling":
                     logger.warning(_RATE_LIMIT_MSG)
-                    raise ModelThrottledException(str(e)) from e
+                    raise ModelThrottledException(str(error)) from error
+                if error_kind == "context_overflow":
+                    logger.warning(_CONTEXT_WINDOW_OVERFLOW_MSG)
+                    raise ContextWindowOverflowException(str(error)) from error
                 raise
 
             # Close current content block if we had any
@@ -454,11 +490,13 @@ class OpenAIResponsesModel(Model):
                 yield self._format_chunk({"chunk_type": "content_delta", "data_type": "tool", "data": tool_call})
                 yield self._format_chunk({"chunk_type": "content_stop", "data_type": "tool"})
 
-            # Determine finish reason: tool_calls > max_tokens (length) > normal stop
-            if tool_calls:
+            # Determine finish reason: max_tokens (length) or content_filter > tool_calls > normal stop.
+            # A function call that is still in flight when the response is cut off has truncated
+            # arguments, so it must surface as the cut-off reason rather than be executed.
+            if stop_reason in ("length", "content_filter"):
+                finish_reason = stop_reason
+            elif tool_calls:
                 finish_reason = "tool_calls"
-            elif stop_reason == "length":
-                finish_reason = "length"
             else:
                 finish_reason = "stop"
             yield self._format_chunk({"chunk_type": "message_stop", "data": finish_reason})
@@ -492,14 +530,15 @@ class OpenAIResponsesModel(Model):
                 request = self._format_request(prompt, system_prompt=system_prompt)
                 request.pop("stream", None)
                 response = await client.responses.parse(**request, text_format=output_model)
-            except openai.BadRequestError as e:
-                if hasattr(e, "code") and e.code == "context_length_exceeded":
+            except openai.APIError as error:
+                error_kind = classify_openai_error(error)
+                if error_kind == "throttling":
+                    logger.warning(_RATE_LIMIT_MSG)
+                    raise ModelThrottledException(str(error)) from error
+                if error_kind == "context_overflow":
                     logger.warning(_CONTEXT_WINDOW_OVERFLOW_MSG)
-                    raise ContextWindowOverflowException(str(e)) from e
+                    raise ContextWindowOverflowException(str(error)) from error
                 raise
-            except openai.RateLimitError as e:
-                logger.warning(_RATE_LIMIT_MSG)
-                raise ModelThrottledException(str(e)) from e
 
         if response.output_parsed:
             yield {"output": response.output_parsed}
@@ -513,6 +552,7 @@ class OpenAIResponsesModel(Model):
         system_prompt: str | None = None,
         tool_choice: ToolChoice | None = None,
         model_state: dict[str, Any] | None = None,
+        agent_metadata: AgentMetadata | None = None,
     ) -> dict[str, Any]:
         """Format an OpenAI Responses API compatible response streaming request.
 
@@ -522,6 +562,7 @@ class OpenAIResponsesModel(Model):
             system_prompt: System prompt to provide context to the model.
             tool_choice: Selection strategy for tool invocation.
             model_state: Runtime state for model providers (e.g., server-side response ids).
+            agent_metadata: Invoking agent's metadata.
 
         Returns:
             An OpenAI Responses API compatible response streaming request.
@@ -565,6 +606,8 @@ class OpenAIResponsesModel(Model):
                 ),
             ]
             request.update(self._format_request_tool_choice(tool_choice))
+
+        apply_cache_config(request, cast(CacheConfig | None, self.config.get("cache_config")), agent_metadata)
 
         return request
 
@@ -613,10 +656,22 @@ class OpenAIResponsesModel(Model):
                     "reasoningContent is not yet supported in multi-turn conversations with the Responses API"
                 )
 
+            if any("cachePoint" in content for content in contents):
+                logger.warning("cachePoint content block is not supported by OpenAI Responses | skipping")
+
+            filtered_contents = []
+            for content in contents:
+                if any(
+                    block_type in content for block_type in ["toolResult", "toolUse", "reasoningContent", "cachePoint"]
+                ):
+                    continue
+                if _has_location_source(content):
+                    logger.warning("Location sources are not supported by OpenAI Responses | skipping content block")
+                    continue
+                filtered_contents.append(content)
+
             formatted_contents = [
-                cls._format_request_message_content(content, role=role)
-                for content in contents
-                if not any(block_type in content for block_type in ["toolResult", "toolUse", "reasoningContent"])
+                cls._format_request_message_content(content, role=role) for content in filtered_contents
             ]
 
             formatted_tool_calls = [
@@ -632,12 +687,30 @@ class OpenAIResponsesModel(Model):
             ]
 
             if formatted_contents:
-                formatted_messages.append(
-                    {
-                        "role": role,  # "user" | "assistant"
-                        "content": formatted_contents,
-                    }
-                )
+                if role == "assistant":
+                    # Only the string EasyInputMessage form is a valid assistant *input* shape
+                    # without the full output-item metadata (id/status/annotations) that has
+                    # already been discarded by this point. Replaying verbatim output items is
+                    # tracked in https://github.com/strands-agents/harness-sdk/issues/3389.
+                    dropped_types = [
+                        part.get("type", "unknown") for part in formatted_contents if part.get("type") != "output_text"
+                    ]
+                    if dropped_types:
+                        logger.warning(
+                            "content_type=<%s> | non-text assistant history content has no valid "
+                            "Responses API input shape | dropping",
+                            ", ".join(dropped_types),
+                        )
+                    text = "\n".join(part["text"] for part in formatted_contents if part.get("type") == "output_text")
+                    if text:
+                        formatted_messages.append({"role": "assistant", "content": text})
+                else:
+                    formatted_messages.append(
+                        {
+                            "role": role,  # "user"
+                            "content": formatted_contents,
+                        }
+                    )
 
             formatted_messages.extend(formatted_tool_calls)
             formatted_messages.extend(formatted_tool_messages)
@@ -667,7 +740,10 @@ class OpenAIResponsesModel(Model):
         if "document" in content:
             doc = content["document"]
             data_url = _encode_media_to_data_url(doc["source"]["bytes"], doc["format"], "document")
-            return {"type": "input_file", "file_url": data_url}
+            name = doc.get("name", "document")
+            suffix = f".{doc['format']}"
+            filename = name if name.endswith(suffix) else f"{name}{suffix}"
+            return {"type": "input_file", "filename": filename, "file_data": data_url}
 
         if "image" in content:
             img = content["image"]
@@ -737,7 +813,10 @@ class OpenAIResponsesModel(Model):
                 has_media = True
                 doc = content["document"]
                 data_url = _encode_media_to_data_url(doc["source"]["bytes"], doc["format"], "document")
-                output_parts.append({"type": "input_file", "file_url": data_url})
+                name = doc.get("name", "document")
+                suffix = f".{doc['format']}"
+                filename = name if name.endswith(suffix) else f"{name}{suffix}"
+                output_parts.append({"type": "input_file", "filename": filename, "file_data": data_url})
 
         # Return array if has media content, otherwise join as string for simpler text-only cases
         output: list[dict[str, Any]] | str
@@ -837,6 +916,8 @@ class OpenAIResponsesModel(Model):
                         return {"messageStop": {"stopReason": "tool_use"}}
                     case "length":
                         return {"messageStop": {"stopReason": "max_tokens"}}
+                    case "content_filter":
+                        return {"messageStop": {"stopReason": "content_filtered"}}
                     case _:
                         return {"messageStop": {"stopReason": "end_turn"}}
 
@@ -850,8 +931,13 @@ class OpenAIResponsesModel(Model):
 
                 if tokens_details := getattr(event["data"], "input_tokens_details", None):
                     cached = getattr(tokens_details, "cached_tokens", None)
-                    if isinstance(cached, int) and cached:
+                    if isinstance(cached, int):
                         usage_data["cacheReadInputTokens"] = cached
+
+                    # Reported first-party from GPT-5.6
+                    cache_write = getattr(tokens_details, "cache_write_tokens", None)
+                    if isinstance(cache_write, int):
+                        usage_data["cacheWriteInputTokens"] = cache_write
 
                 return {
                     "metadata": {

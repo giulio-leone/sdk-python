@@ -2,6 +2,7 @@ import type { JSONValue } from '../../types/json.js'
 import type { MessageData, ContentBlockData } from '../../types/messages.js'
 import type { Model } from '../../models/model.js'
 import type { LocalAgent } from '../../types/agent.js'
+import type { Tracer } from '../../telemetry/tracer.js'
 
 // `keyof` over a union yields only the keys every member shares (none, here). The conditional makes
 // it distribute over each member instead, collecting the union of their individual keys.
@@ -52,8 +53,14 @@ export interface ExtractionResult {
  * {@link defaultModel}.
  */
 export interface ExtractorContext {
-  /** The agent's model, supplied so an extractor can default to it. */
+  /** Model an extractor without its own falls back to (`agent.auxModel > agent.model`). */
   defaultModel?: Model
+  /**
+   * Tracer for wrapping the extractor's model call in a span, parented to the active extraction
+   * span. Supplied by the {@link ExtractionCoordinator}; omitted for direct/standalone use.
+   * @internal
+   */
+  tracer?: Tracer
 }
 
 /**

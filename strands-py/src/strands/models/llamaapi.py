@@ -1,7 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 """Llama API model provider.
 
-- Docs: https://llama.developer.meta.com/
+Deprecated: The Llama API service has been deprecated by Meta. This provider will be removed
+in v2.0.0. Migrate to another provider (BedrockModel, OllamaModel, or OpenAIModel) that hosts
+Llama or comparable models.
 """
 
 import base64
@@ -14,10 +16,10 @@ from typing import Any, TypeVar, cast
 import llama_api_client
 from llama_api_client import LlamaAPIClient
 from pydantic import BaseModel
-from typing_extensions import Unpack, override
+from typing_extensions import Unpack, deprecated, override
 
 from ..types.content import ContentBlock, Messages
-from ..types.exceptions import ModelThrottledException
+from ..types.exceptions import ContextWindowOverflowException, ModelThrottledException
 from ..types.streaming import StreamEvent, Usage
 from ..types.tools import ToolChoice, ToolResult, ToolSpec, ToolUse
 from ._validation import _has_location_source, validate_config_keys, warn_on_tool_choice_not_supported
@@ -28,8 +30,26 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T", bound=BaseModel)
 
 
+@deprecated(
+    "LlamaAPIModel is deprecated and will be removed in v2.0.0. "
+    "The underlying Llama API service has been deprecated by Meta. "
+    "Use BedrockModel, OllamaModel, or OpenAIModel instead."
+)
 class LlamaAPIModel(Model):
-    """Llama API model provider implementation."""
+    """Llama API model provider implementation.
+
+    Deprecated: The Llama API service has been deprecated by Meta. This class will be removed
+    in v2.0.0. Use BedrockModel, OllamaModel, or OpenAIModel instead.
+    """
+
+    OVERFLOW_MESSAGES = {
+        "this model's maximum context length is",
+        "exceed context limit",
+        "model's maximum context limit",
+        "is longer than the model's context length",
+        "prompt is too long",
+        "too many tokens",
+    }
 
     class LlamaConfig(BaseModelConfig, total=False):
         """Configuration options for Llama API models.
@@ -355,6 +375,7 @@ class LlamaAPIModel(Model):
             Formatted message chunks from the model.
 
         Raises:
+            ContextWindowOverflowException: If the input exceeds the model's context window.
             ModelThrottledException: When the model service is throttling requests from the client.
         """
         warn_on_tool_choice_not_supported(tool_choice)
@@ -368,6 +389,10 @@ class LlamaAPIModel(Model):
             response = self.client.chat.completions.create(**request)
         except llama_api_client.RateLimitError as e:
             raise ModelThrottledException(str(e)) from e
+        except llama_api_client.BadRequestError as e:
+            if any(message in str(e).lower() for message in self.OVERFLOW_MESSAGES):
+                raise ContextWindowOverflowException(str(e)) from e
+            raise
 
         logger.debug("got response from model")
         yield self.format_chunk({"chunk_type": "message_start"})

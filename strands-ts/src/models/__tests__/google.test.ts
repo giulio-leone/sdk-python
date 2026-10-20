@@ -319,6 +319,151 @@ describe('GoogleModel', () => {
       })
     })
 
+    // Regression for the token miscount catalogued in #3546: totalTokenCount sums four disjoint buckets
+    // (prompt + candidates + toolUsePrompt + thoughts), so subtracting only prompt miscounts the
+    // input-side toolUsePrompt tokens as output.
+    it('counts tool-use tokens as input and thinking tokens as output', async () => {
+      const { provider, messages } = setupStreamTest(async function* () {
+        yield {
+          candidates: [{ content: { parts: [{ text: 'Hi' }] } }],
+          usageMetadata: {
+            promptTokenCount: 100,
+            candidatesTokenCount: 20,
+            toolUsePromptTokenCount: 5,
+            thoughtsTokenCount: 30,
+            totalTokenCount: 155,
+          },
+        }
+        yield { candidates: [{ finishReason: 'STOP' }] }
+      })
+
+      const events = await collectIterator(provider.stream(messages))
+
+      const metadataEvent = events.find((e) => e.type === 'modelMetadataEvent')
+      expect(metadataEvent).toEqual({
+        type: 'modelMetadataEvent',
+        usage: {
+          inputTokens: 105,
+          outputTokens: 50,
+          totalTokens: 155,
+        },
+      })
+    })
+
+    it('surfaces cache-read tokens when present', async () => {
+      const { provider, messages } = setupStreamTest(async function* () {
+        yield {
+          candidates: [{ content: { parts: [{ text: 'Hi' }] } }],
+          usageMetadata: {
+            promptTokenCount: 100,
+            candidatesTokenCount: 20,
+            cachedContentTokenCount: 25,
+            totalTokenCount: 120,
+          },
+        }
+        yield { candidates: [{ finishReason: 'STOP' }] }
+      })
+
+      const events = await collectIterator(provider.stream(messages))
+
+      const metadataEvent = events.find((e) => e.type === 'modelMetadataEvent')
+      expect(metadataEvent).toEqual({
+        type: 'modelMetadataEvent',
+        usage: {
+          inputTokens: 100,
+          outputTokens: 20,
+          totalTokens: 120,
+          cacheReadInputTokens: 25,
+        },
+      })
+    })
+
+    it('omits cache-read tokens when cachedContentTokenCount is 0', async () => {
+      const { provider, messages } = setupStreamTest(async function* () {
+        yield {
+          candidates: [{ content: { parts: [{ text: 'Hi' }] } }],
+          usageMetadata: {
+            promptTokenCount: 100,
+            candidatesTokenCount: 20,
+            cachedContentTokenCount: 0,
+            totalTokenCount: 120,
+          },
+        }
+        yield { candidates: [{ finishReason: 'STOP' }] }
+      })
+
+      const events = await collectIterator(provider.stream(messages))
+
+      const metadataEvent = events.find((e) => e.type === 'modelMetadataEvent')
+      expect(metadataEvent).toEqual({
+        type: 'modelMetadataEvent',
+        usage: {
+          inputTokens: 100,
+          outputTokens: 20,
+          totalTokens: 120,
+        },
+      })
+    })
+
+    it('clears cache-read tokens when a later usage chunk reports none', async () => {
+      const { provider, messages } = setupStreamTest(async function* () {
+        yield {
+          candidates: [{ content: { parts: [{ text: 'Hi' }] } }],
+          usageMetadata: {
+            promptTokenCount: 100,
+            candidatesTokenCount: 20,
+            cachedContentTokenCount: 25,
+            totalTokenCount: 120,
+          },
+        }
+        yield {
+          candidates: [{ finishReason: 'STOP' }],
+          usageMetadata: {
+            promptTokenCount: 100,
+            candidatesTokenCount: 20,
+            totalTokenCount: 120,
+          },
+        }
+      })
+
+      const events = await collectIterator(provider.stream(messages))
+
+      const metadataEvent = events.find((e) => e.type === 'modelMetadataEvent')
+      expect(metadataEvent).toEqual({
+        type: 'modelMetadataEvent',
+        usage: {
+          inputTokens: 100,
+          outputTokens: 20,
+          totalTokens: 120,
+        },
+      })
+    })
+
+    it('clamps output to zero when totalTokenCount is below promptTokenCount', async () => {
+      const { provider, messages } = setupStreamTest(async function* () {
+        yield {
+          candidates: [{ content: { parts: [{ text: 'Hi' }] } }],
+          usageMetadata: {
+            promptTokenCount: 10,
+            totalTokenCount: 5,
+          },
+        }
+        yield { candidates: [{ finishReason: 'STOP' }] }
+      })
+
+      const events = await collectIterator(provider.stream(messages))
+
+      const metadataEvent = events.find((e) => e.type === 'modelMetadataEvent')
+      expect(metadataEvent).toEqual({
+        type: 'modelMetadataEvent',
+        usage: {
+          inputTokens: 10,
+          outputTokens: 0,
+          totalTokens: 5,
+        },
+      })
+    })
+
     it('handles MAX_TOKENS finish reason', async () => {
       const { provider, messages } = setupStreamTest(async function* () {
         yield {
@@ -827,7 +972,7 @@ describe('GoogleModel', () => {
         })
       )
 
-      const config = captured.config as { tools?: unknown[] }
+      const config = captured.config as { tools?: unknown[]; toolConfig?: Record<string, unknown> }
       expect(config.tools).toHaveLength(2)
       expect(config.tools![0]).toEqual({
         functionDeclarations: [
@@ -839,6 +984,82 @@ describe('GoogleModel', () => {
         ],
       })
       expect(config.tools![1]).toEqual({ googleSearch: {} })
+      expect(config.toolConfig?.includeServerSideToolInvocations).toBe(true)
+    })
+
+    it('sets includeServerSideToolInvocations and preserves functionCallingConfig when toolChoice is set', async () => {
+      const { client, captured } = createMockClientWithCapture()
+      const provider = new GoogleModel({ client, builtInTools: [{ googleSearch: {} }] })
+      const messages = [new Message({ role: 'user', content: [new TextBlock('Hi')] })]
+
+      await collectIterator(
+        provider.stream(messages, {
+          toolSpecs: [{ name: 'read', description: 'read' }],
+          toolChoice: { auto: {} },
+        })
+      )
+
+      const config = captured.config as { toolConfig?: unknown }
+      expect(config.toolConfig).toEqual({
+        functionCallingConfig: { mode: FunctionCallingConfigMode.AUTO },
+        includeServerSideToolInvocations: true,
+      })
+    })
+
+    it('does not set includeServerSideToolInvocations on Vertex AI', async () => {
+      const captured: Record<string, unknown> = {}
+      const client = {
+        vertexai: true,
+        models: {
+          generateContentStream: vi.fn(async (params: Record<string, unknown>) => {
+            Object.assign(captured, params)
+            return (async function* () {
+              yield { candidates: [{ finishReason: 'STOP' }] }
+            })()
+          }),
+        },
+      } as unknown as GoogleGenAI
+      const provider = new GoogleModel({ client, builtInTools: [{ googleSearch: {} }] })
+      const messages = [new Message({ role: 'user', content: [new TextBlock('Hi')] })]
+
+      await collectIterator(
+        provider.stream(messages, {
+          toolSpecs: [{ name: 'read', description: 'read' }],
+        })
+      )
+
+      const config = captured.config as { toolConfig?: unknown }
+      expect(config.toolConfig).toBeUndefined()
+    })
+
+    it.each([
+      {
+        name: 'merges flag into params-supplied toolConfig',
+        paramsToolConfig: { functionCallingConfig: { mode: 'NONE' } },
+        expectedToolConfig: { functionCallingConfig: { mode: 'NONE' }, includeServerSideToolInvocations: true },
+      },
+      {
+        name: 'preserves explicit includeServerSideToolInvocations=false',
+        paramsToolConfig: { includeServerSideToolInvocations: false },
+        expectedToolConfig: { includeServerSideToolInvocations: false },
+      },
+    ])('$name', async ({ paramsToolConfig, expectedToolConfig }) => {
+      const { client, captured } = createMockClientWithCapture()
+      const provider = new GoogleModel({
+        client,
+        builtInTools: [{ googleSearch: {} }],
+        params: { toolConfig: paramsToolConfig },
+      })
+      const messages = [new Message({ role: 'user', content: [new TextBlock('Hi')] })]
+
+      await collectIterator(
+        provider.stream(messages, {
+          toolSpecs: [{ name: 'read', description: 'read' }],
+        })
+      )
+
+      const config = captured.config as { toolConfig?: unknown }
+      expect(config.toolConfig).toEqual(expectedToolConfig)
     })
 
     it('passes builtInTools when no toolSpecs provided', async () => {
@@ -1118,6 +1339,7 @@ describe('GoogleModel', () => {
         hasToolCalls: false,
         inputTokens: 0,
         outputTokens: 0,
+        totalTokens: 0,
       }
     }
 
