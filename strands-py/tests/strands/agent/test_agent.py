@@ -26,7 +26,7 @@ from strands.agent.conversation_manager.null_conversation_manager import NullCon
 from strands.agent.conversation_manager.sliding_window_conversation_manager import SlidingWindowConversationManager
 from strands.agent.state import AgentState
 from strands.handlers.callback_handler import PrintingCallbackHandler, null_callback_handler
-from strands.hooks import BeforeInvocationEvent, BeforeModelCallEvent, BeforeToolCallEvent
+from strands.hooks import BeforeInvocationEvent, BeforeModelCallEvent, BeforeToolCallEvent, MessageAddedEvent
 from strands.interrupt import Interrupt, PendingToolExecution
 from strands.memory import MemoryManager, MemoryManagerConfig
 from strands.models.bedrock import DEFAULT_BEDROCK_MODEL_ID, BedrockModel
@@ -1931,47 +1931,27 @@ def test_agent_restored_from_session_management_with_redacted_input():
 
 
 def test_agent_redacts_user_message_not_ltm_context():
-    """Test that guardrail redacts the last *user* message, not a trailing LTM assistant message.
-
-    Reproduces: https://github.com/strands-agents/sdk-python/issues/1639
-    When long-term memory (LTM) session managers append an assistant message with
-    user context after the user turn, the redact logic must still target the user
-    message rather than the trailing assistant LTM message.
-    """
+    """Guardrail redaction preserves trailing session context (#1639)."""
     mocked_model = MockedModelProvider(
         [{"redactedUserContent": "BLOCKED!", "redactedAssistantContent": "INPUT BLOCKED!"}]
     )
+    agent = Agent(model=mocked_model, callback_handler=None)
+    ltm_message = {"role": "assistant", "content": [{"text": "<user_context>likes cats</user_context>"}]}
 
-    agent = Agent(
-        model=mocked_model,
-        system_prompt="You are a helpful assistant.",
-        callback_handler=None,
-    )
+    def append_ltm_context(event):
+        if event.message["role"] == "user":
+            event.agent.messages.append(copy.deepcopy(ltm_message))
 
-    # Simulate LTM session manager appending context after user message:
-    # messages[0] = user input, messages[1] = assistant LTM context
-    agent.messages.append({"role": "user", "content": [{"text": "Tell me something bad"}]})
-    agent.messages.append(
-        {"role": "assistant", "content": [{"text": "<user_context>Preference: likes cats</user_context>"}]}
-    )
+    agent.hooks.add_callback(MessageAddedEvent, append_ltm_context)
+    agent("Tell me something bad")
 
-    # Run the agent — guardrail should redact the user message (index 0), not the LTM message
-    response = agent("ignored")  # noqa: F841 -- triggers model which triggers redact
+    user_messages = [message for message in agent.messages if message["role"] == "user"]
+    assert len(user_messages) == 1
+    assert user_messages[0]["content"] == [{"text": "BLOCKED!"}]
+    assert agent.messages[1] == ltm_message
 
-    # Find the user messages — the first user message (the actual input) should be redacted
-    user_messages = [m for m in agent.messages if m["role"] == "user"]
-    assert len(user_messages) >= 1
-    # The last user message before the LTM context should have been redacted
-    # Check that at least one user message was redacted
-    redacted_user = [m for m in user_messages if m["content"] == [{"text": "BLOCKED!"}]]
-    assert len(redacted_user) >= 1, f"Expected at least one redacted user message, got: {user_messages}"
 
-    # The assistant LTM message should NOT have been redacted
-    assistant_messages = [m for m in agent.messages if m["role"] == "assistant"]
-    ltm_messages = [m for m in assistant_messages if any("<user_context>" in str(c) for c in m.get("content", []))]
-    for ltm in ltm_messages:
-        assert ltm["content"] != [{"text": "BLOCKED!"}], "LTM context message should not be redacted"
-
+def test_agent_restored_from_session_management_with_correct_index():
     mock_model_provider = MockedModelProvider(
         [{"role": "assistant", "content": [{"text": "hello!"}]}, {"role": "assistant", "content": [{"text": "world!"}]}]
     )

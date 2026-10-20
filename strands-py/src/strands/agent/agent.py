@@ -1876,6 +1876,8 @@ class Agent(AgentBase, LocalAgent):
                         )
                         if self._session_manager:
                             self._session_manager.redact_latest_message(last_user_message, self)
+                    else:
+                        logger.warning("no user message found to redact | guardrail redaction skipped")
                 yield event
 
         return terminal
