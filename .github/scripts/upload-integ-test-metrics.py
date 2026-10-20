@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 import sys
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timezone
 from dataclasses import dataclass
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, Optional, TypedDict
 import os
 import boto3
 
@@ -32,15 +32,15 @@ class TestResult:
     outcome: Literal['failed', 'skipped', 'passed']
 
 
-def parse_junit_xml(xml_file_path: str) -> list[TestResult]:
+def parse_junit_xml(xml_file_path: str) -> Optional[list[TestResult]]:
     try:
         tree = ET.parse(xml_file_path)
     except FileNotFoundError:
         print(f"Warning: XML file not found: {xml_file_path}")
-        return []
+        return None
     except ET.ParseError as e:
         print(f"Warning: Failed to parse XML: {e}")
-        return []
+        return None
 
     results = []
     root = tree.getroot()
@@ -65,15 +65,16 @@ def parse_junit_xml(xml_file_path: str) -> list[TestResult]:
     return results
 
 
-def build_metric_data(test_results: list[TestResult], repository: str) -> list[MetricDatum]:
+def build_metric_data(test_results: list[TestResult], repository: str, sdk: str) -> list[MetricDatum]:
     metrics: list[MetricDatum] = []
-    timestamp = datetime.utcnow()
-    
+    timestamp = datetime.now(timezone.utc)
+
     for test in test_results:
         test_name = f"{test.classname}.{test.name}"
         dimensions: list[Dimension] = [
             Dimension(Name='TestName', Value=test_name),
-            Dimension(Name='Repository', Value=repository)
+            Dimension(Name='Repository', Value=repository),
+            Dimension(Name='SDK', Value=sdk)
         ]
         
         metrics.append(MetricDatum(
@@ -125,21 +126,24 @@ def publish_metrics(metric_data: list[dict[str, Any]], region: str):
 
 
 def main():
-    if len(sys.argv) != 3:
-        print("Usage: python upload-integ-test-metrics.py <xml_file> <repository_name>")
-        sys.exit(0)
-    
+    if len(sys.argv) not in (3, 4):
+        print("Usage: python upload-integ-test-metrics.py <xml_file> <repository_name> [sdk]")
+        sys.exit(1)
+
     xml_file = sys.argv[1]
     repository = sys.argv[2]
+    sdk = sys.argv[3] if len(sys.argv) > 3 else 'python'
     region = os.environ.get('AWS_REGION', 'us-east-1')
-    
+
     test_results = parse_junit_xml(xml_file)
-    if not test_results:
-        print("No test results found")
+    if test_results is None:
         sys.exit(1)
-    
+    if not test_results:
+        print("No test results to publish")
+        return
+
     print(f"Found {len(test_results)} test results")
-    metric_data = build_metric_data(test_results, repository)
+    metric_data = build_metric_data(test_results, repository, sdk)
     publish_metrics(metric_data, region)
 
 
